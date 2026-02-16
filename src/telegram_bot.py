@@ -46,10 +46,10 @@ dp.include_router(router)
 
 def owner_only(handler):
     """Декоратор: только владелец может использовать."""
-    async def wrapper(message: Message, *args, **kwargs):
+    async def wrapper(message: Message, **kwargs):
         if message.from_user.id != config.TELEGRAM_OWNER_ID:
             return
-        return await handler(message, *args, **kwargs)
+        return await handler(message)
     return wrapper
 
 
