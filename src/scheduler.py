@@ -1,12 +1,16 @@
 import asyncio
+import json
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from src import config
-from src.db import get_active_tasks, get_db_stats, heartbeat
+from src.db import (
+    get_active_tasks, get_db_stats, get_setting, heartbeat,
+    get_messages_since, get_dm_summary_data,
+)
 from src.ai_brain import brain
 from src.confidence_manager import send_batch_review
 
@@ -31,7 +35,7 @@ async def notify_owner(text: str, **kwargs):
 # ─── Задачи ──────────────────────────────────────────────────
 
 async def morning_briefing():
-    """08:00 МСК — утренний брифинг."""
+    """Утренний брифинг с summary по группам и ЛС."""
     try:
         tasks = await get_active_tasks()
         stats = await get_db_stats()
@@ -50,6 +54,37 @@ async def morning_briefing():
         }
         briefing = await brain.generate_briefing(data)
         await notify_owner(briefing)
+
+        # Summary по whitelist-группам за последние 12 часов
+        since = datetime.now(timezone.utc) - timedelta(hours=12)
+        raw_wl = await get_setting("whitelist", "[]")
+        try:
+            wl_ids = json.loads(raw_wl)
+        except json.JSONDecodeError:
+            wl_ids = []
+
+        if wl_ids:
+            group_msgs = await get_messages_since(since, chat_ids=wl_ids)
+            if group_msgs:
+                # Группируем по чату
+                grouped = {}
+                for m in group_msgs:
+                    title = m["chat_title"] or str(m["chat_id"])
+                    if title not in grouped:
+                        grouped[title] = []
+                    grouped[title].append(f"{m['sender_name']}: {m['text'][:150]}")
+
+                summary = await brain.generate_group_summary(grouped)
+                if summary:
+                    await notify_owner(f"📋 ОБЗОР ГРУПП:\n\n{summary}")
+
+        # Summary по ЛС
+        dm_data = await get_dm_summary_data(since)
+        if dm_data:
+            dm_summary = await brain.generate_dm_summary(dm_data)
+            if dm_summary:
+                await notify_owner(f"💬 ЛИЧНЫЕ СООБЩЕНИЯ:\n\n{dm_summary}")
+
         logger.info("Утренний брифинг отправлен")
     except Exception as e:
         logger.error(f"Ошибка утреннего брифинга: {e}", exc_info=True)
@@ -64,10 +99,13 @@ async def confidence_batch():
 
 
 async def evening_digest():
-    """20:00 МСК — вечерний дайджест."""
+    """Вечерний дайджест с summary за день."""
     try:
         tasks = await get_active_tasks()
         stats = await get_db_stats()
+
+        # Сообщения за последние 12 часов (с утра)
+        since = datetime.now(timezone.utc) - timedelta(hours=12)
 
         data = {
             "completed": 0,
@@ -77,10 +115,37 @@ async def evening_digest():
             "events": [],
         }
         digest = await brain.generate_digest(data)
-
-        # Добавляем статус системы
         system_line = f"\nСИСТЕМА: {stats.get('db_size', '?')} БД"
         await notify_owner(digest + system_line)
+
+        # Summary по whitelist-группам за день
+        raw_wl = await get_setting("whitelist", "[]")
+        try:
+            wl_ids = json.loads(raw_wl)
+        except json.JSONDecodeError:
+            wl_ids = []
+
+        if wl_ids:
+            group_msgs = await get_messages_since(since, chat_ids=wl_ids)
+            if group_msgs:
+                grouped = {}
+                for m in group_msgs:
+                    title = m["chat_title"] or str(m["chat_id"])
+                    if title not in grouped:
+                        grouped[title] = []
+                    grouped[title].append(f"{m['sender_name']}: {m['text'][:150]}")
+
+                summary = await brain.generate_group_summary(grouped)
+                if summary:
+                    await notify_owner(f"📋 ОБЗОР ГРУПП ЗА ДЕНЬ:\n\n{summary}")
+
+        # Summary по ЛС за день
+        dm_data = await get_dm_summary_data(since)
+        if dm_data:
+            dm_summary = await brain.generate_dm_summary(dm_data)
+            if dm_summary:
+                await notify_owner(f"💬 ЛС ЗА ДЕНЬ:\n\n{dm_summary}")
+
         logger.info("Вечерний дайджест отправлен")
     except Exception as e:
         logger.error(f"Ошибка вечернего дайджеста: {e}", exc_info=True)

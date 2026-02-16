@@ -236,6 +236,52 @@ async def _search_messages_ilike(query: str, limit: int = 20) -> list:
         return [dict(r) for r in rows]
 
 
+# ─── Выборка сообщений за период ────────────────────────────
+
+async def get_messages_since(since: datetime, chat_ids: list = None, limit: int = 500) -> list:
+    """Получает сообщения за период, опционально фильтруя по chat_id."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if chat_ids:
+            rows = await conn.fetch(
+                """SELECT chat_id, chat_title, sender_name, text, timestamp
+                   FROM messages
+                   WHERE timestamp >= $1 AND chat_id = ANY($2::bigint[])
+                   ORDER BY chat_id, timestamp
+                   LIMIT $3""",
+                since, chat_ids, limit
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT chat_id, chat_title, sender_name, text, timestamp
+                   FROM messages
+                   WHERE timestamp >= $1
+                   ORDER BY timestamp DESC
+                   LIMIT $2""",
+                since, limit
+            )
+        return [dict(r) for r in rows]
+
+
+async def get_dm_summary_data(since: datetime, limit: int = 100) -> list:
+    """Получает ЛС-сообщения за период (sender_id != owner), сгруппированные по отправителю."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT sender_name, COUNT(*) as msg_count,
+                      STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
+               FROM messages
+               WHERE timestamp >= $1
+                 AND sender_id != $2
+                 AND chat_id = sender_id
+               GROUP BY sender_name
+               ORDER BY msg_count DESC
+               LIMIT $3""",
+            since, 0, limit  # sender_id != 0 фильтрует системные
+        )
+        return [dict(r) for r in rows]
+
+
 # ─── Сборка контекста для AI-запросов ─────────────────────────
 
 # Стоп-слова (не ключевые для поиска)
