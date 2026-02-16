@@ -113,6 +113,11 @@ async def stop_listener():
 
 # ─── Обработка сообщений ─────────────────────────────────────
 
+def _is_private_chat(msg) -> bool:
+    """Проверяет, является ли сообщение из личного чата (ЛС)."""
+    return isinstance(msg.peer_id, PeerUser)
+
+
 async def on_new_message(event):
     try:
         msg = event.message
@@ -125,11 +130,17 @@ async def on_new_message(event):
         if _should_ignore(msg):
             return
 
-        # Фильтр: обрабатываем только whitelist-чаты
         chat_id = msg.chat_id or 0
+        is_private = _is_private_chat(msg)
         whitelist = await _get_whitelist()
-        if not whitelist or chat_id not in whitelist:
-            return  # Whitelist пустой или чат не в списке — игнорируем
+        in_whitelist = chat_id in whitelist
+
+        # Три режима:
+        # 1. Whitelist-чаты → сохранять + AI-классификация
+        # 2. Личные чаты (ЛС) → тихо сохранять в БД
+        # 3. Остальные группы → игнорировать
+        if not in_whitelist and not is_private:
+            return  # Группа не из whitelist — игнорируем
 
         # Получаем информацию об отправителе
         sender = await msg.get_sender()
@@ -147,7 +158,11 @@ async def on_new_message(event):
         if not text and media_type:
             text = f"[{media_type}]"
 
-        # Сохраняем в БД (ВСЕ сообщения). None = дубликат
+        # Пропуск пустых сообщений
+        if not text:
+            return
+
+        # Сохраняем в БД. None = дубликат
         db_msg_id = await save_message(
             telegram_msg_id=msg.id,
             chat_id=chat_id,
@@ -162,6 +177,13 @@ async def on_new_message(event):
         if db_msg_id is None:
             return  # Дубликат — пропускаем
 
+        # Для личных чатов — тихо сохраняем, без AI и уведомлений
+        if is_private and not in_whitelist:
+            await mark_message_processed(db_msg_id)
+            return
+
+        # --- Ниже только whitelist-чаты ---
+
         # Проверка: новый контакт?
         if sender_id and sender_id != config.TELEGRAM_OWNER_ID:
             is_known = await is_known_contact(sender_id)
@@ -172,14 +194,11 @@ async def on_new_message(event):
                     f"Новый контакт: {sender_name}\n"
                     f"Первое сообщение: \"{preview}\"\n"
                     f"Чат: {chat_title}",
-                    reply_markup_type="new_contact",
-                    contact_id=contact["id"],
                 )
 
-        # Классификация AI (whitelist уже проверен выше)
+        # Классификация AI
         if text and len(text) > 5:
             if _classify_callback:
-                # Отправляем на классификацию (асинхронно, не блокируем)
                 asyncio.create_task(
                     _classify_callback(db_msg_id, text, sender_name, chat_title, chat_id)
                 )
