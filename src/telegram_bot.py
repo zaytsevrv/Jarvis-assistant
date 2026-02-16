@@ -68,15 +68,13 @@ async def _mode_footer() -> str:
 
 
 async def send_to_owner(text: str, reply_markup=None):
-    """Отправка сообщения владельцу с футером."""
-    footer = await _mode_footer()
-    full_text = text + footer
+    """Отправка сообщения владельцу."""
     # Telegram лимит 4096 символов
-    if len(full_text) > 4096:
-        full_text = full_text[:4090] + "..."
+    if len(text) > 4096:
+        text = text[:4090] + "..."
     await bot.send_message(
         config.TELEGRAM_OWNER_ID,
-        full_text,
+        text,
         reply_markup=reply_markup,
         parse_mode=None,
     )
