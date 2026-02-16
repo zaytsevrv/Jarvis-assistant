@@ -20,6 +20,7 @@ from src.db import (
     build_context,
     get_active_tasks,
     get_db_stats,
+    get_known_chats,
     get_module_health,
     get_setting,
     search_messages,
@@ -439,22 +440,25 @@ async def cmd_whitelist(message: Message):
     except json.JSONDecodeError:
         wl = []
 
-    # /whitelist — показать список
+    # /whitelist — показать список + компактная кнопка для управления
     if len(args) < 2:
-        if not wl:
-            await send_to_owner(
-                "Whitelist пуст — listener не мониторит ни один чат.\n\n"
-                "Добавить: /whitelist add <chat_id>\n"
-                "Удалить: /whitelist del <chat_id>\n"
-                "Очистить: /whitelist clear\n\n"
-                "Узнать chat_id: перешли сообщение из чата боту @getmyid_bot"
-            )
-        else:
-            lines = [f"Whitelist ({len(wl)} чатов):"]
+        lines = []
+        if wl:
+            lines.append(f"Whitelist ({len(wl)} чатов):")
             for cid in wl:
                 lines.append(f"  • {cid}")
-            lines.append(f"\nУдалить: /whitelist del <chat_id>")
-            await send_to_owner("\n".join(lines))
+        else:
+            lines.append("Whitelist пуст.")
+
+        lines.append("\nПерешли сообщение из группы — добавлю автоматически.")
+
+        # Одна компактная кнопка — развернуть список чатов
+        buttons = [[InlineKeyboardButton(
+            text="Управление чатами",
+            callback_data="wl_manage",
+        )]]
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await send_to_owner("\n".join(lines), reply_markup=markup)
         return
 
     subcmd = args[1].strip()
@@ -462,7 +466,7 @@ async def cmd_whitelist(message: Message):
     # /whitelist clear
     if subcmd == "clear":
         await set_setting("whitelist", "[]")
-        await send_to_owner("Whitelist очищен. Listener больше ничего не мониторит.")
+        await send_to_owner("Whitelist очищен.")
         return
 
     # /whitelist add <id> или /whitelist del <id>
@@ -472,7 +476,6 @@ async def cmd_whitelist(message: Message):
         return
 
     action = parts[0]
-    # Поддержка нескольких ID через пробел или запятую
     raw_ids = parts[1].replace(",", " ").split()
     added, removed, errors = [], [], []
 
@@ -504,6 +507,209 @@ async def cmd_whitelist(message: Message):
     result.append(f"Всего в whitelist: {len(wl)}")
 
     await send_to_owner("\n".join(result))
+
+
+# ─── Whitelist callbacks ─────────────────────────────────────
+
+@router.callback_query(F.data == "wl_manage")
+async def cb_wl_manage(callback: CallbackQuery):
+    """Показать список известных чатов для управления whitelist."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+
+    raw = await get_setting("whitelist", "[]")
+    try:
+        wl = json.loads(raw)
+    except json.JSONDecodeError:
+        wl = []
+
+    known = await get_known_chats(exclude_private=True)
+    if not known:
+        await callback.answer("Пока нет известных групп в БД")
+        return
+
+    buttons = []
+    row = []
+    for chat in known[:10]:
+        cid = chat["chat_id"]
+        title = chat["chat_title"] or str(cid)
+        short = title[:18] if len(title) <= 18 else title[:16] + ".."
+        if cid in wl:
+            row.append(InlineKeyboardButton(text=f"❌ {short}", callback_data=f"wl_del:{cid}"))
+        else:
+            row.append(InlineKeyboardButton(text=f"➕ {short}", callback_data=f"wl_add:{cid}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    if wl:
+        buttons.append([InlineKeyboardButton(text="Очистить всё", callback_data="wl_clear")])
+    buttons.append([InlineKeyboardButton(text="Закрыть", callback_data="wl_close")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text(
+        f"Whitelist: {len(wl)} чатов. ➕ = добавить, ❌ = убрать:",
+        reply_markup=markup,
+    )
+
+
+@router.callback_query(F.data.startswith("wl_add:"))
+async def cb_wl_add(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    chat_id = int(callback.data.split(":")[1])
+    raw = await get_setting("whitelist", "[]")
+    try:
+        wl = json.loads(raw)
+    except json.JSONDecodeError:
+        wl = []
+
+    if chat_id not in wl:
+        wl.append(chat_id)
+        await set_setting("whitelist", json.dumps(wl))
+        await callback.answer(f"Добавлен: {chat_id}")
+    else:
+        await callback.answer("Уже в whitelist")
+
+    # Обновляем сообщение — показываем актуальное состояние
+    await _refresh_wl_manage(callback.message, wl)
+
+
+@router.callback_query(F.data.startswith("wl_del:"))
+async def cb_wl_del(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    chat_id = int(callback.data.split(":")[1])
+    raw = await get_setting("whitelist", "[]")
+    try:
+        wl = json.loads(raw)
+    except json.JSONDecodeError:
+        wl = []
+
+    if chat_id in wl:
+        wl.remove(chat_id)
+        await set_setting("whitelist", json.dumps(wl))
+        await callback.answer(f"Удалён: {chat_id}")
+    else:
+        await callback.answer("Не было в whitelist")
+
+    await _refresh_wl_manage(callback.message, wl)
+
+
+@router.callback_query(F.data == "wl_clear")
+async def cb_wl_clear(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    await set_setting("whitelist", "[]")
+    await callback.answer("Whitelist очищен")
+    await callback.message.edit_text("Whitelist очищен.")
+
+
+@router.callback_query(F.data == "wl_close")
+async def cb_wl_close(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    raw = await get_setting("whitelist", "[]")
+    try:
+        wl = json.loads(raw)
+    except json.JSONDecodeError:
+        wl = []
+    count = len(wl)
+    await callback.message.edit_text(f"Whitelist: {count} чатов.")
+
+
+async def _refresh_wl_manage(message, wl: list):
+    """Перерисовать кнопки управления whitelist."""
+    known = await get_known_chats(exclude_private=True)
+    buttons = []
+    row = []
+    for chat in known[:10]:
+        cid = chat["chat_id"]
+        title = chat["chat_title"] or str(cid)
+        short = title[:18] if len(title) <= 18 else title[:16] + ".."
+        if cid in wl:
+            row.append(InlineKeyboardButton(text=f"❌ {short}", callback_data=f"wl_del:{cid}"))
+        else:
+            row.append(InlineKeyboardButton(text=f"➕ {short}", callback_data=f"wl_add:{cid}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    if wl:
+        buttons.append([InlineKeyboardButton(text="Очистить всё", callback_data="wl_clear")])
+    buttons.append([InlineKeyboardButton(text="Закрыть", callback_data="wl_close")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await message.edit_text(
+            f"Whitelist: {len(wl)} чатов. ➕ = добавить, ❌ = убрать:",
+            reply_markup=markup,
+        )
+    except Exception:
+        pass  # Сообщение не изменилось — игнорируем
+
+
+# ─── Обработка пересланных сообщений (для whitelist) ─────────
+
+@router.message(F.forward_from_chat)
+@owner_only
+async def handle_forwarded_from_chat(message: Message):
+    """Пересланное сообщение из группы/канала — предложить добавить в whitelist."""
+    chat = message.forward_from_chat
+    chat_id = chat.id
+    chat_title = chat.title or str(chat_id)
+
+    raw = await get_setting("whitelist", "[]")
+    try:
+        wl = json.loads(raw)
+    except json.JSONDecodeError:
+        wl = []
+
+    if chat_id in wl:
+        await send_to_owner(f"Чат «{chat_title}» ({chat_id}) уже в whitelist.")
+        return
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Да, добавить", callback_data=f"wl_fwd_add:{chat_id}"),
+        InlineKeyboardButton(text="Нет", callback_data="wl_fwd_no"),
+    ]])
+    await send_to_owner(
+        f"Добавить «{chat_title}» ({chat_id}) в whitelist?",
+        reply_markup=markup,
+    )
+
+
+@router.callback_query(F.data.startswith("wl_fwd_add:"))
+async def cb_wl_fwd_add(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    chat_id = int(callback.data.split(":")[1])
+    raw = await get_setting("whitelist", "[]")
+    try:
+        wl = json.loads(raw)
+    except json.JSONDecodeError:
+        wl = []
+
+    if chat_id not in wl:
+        wl.append(chat_id)
+        await set_setting("whitelist", json.dumps(wl))
+
+    await callback.answer("Добавлено!")
+    await callback.message.edit_text(
+        f"Чат {chat_id} добавлен в whitelist. Всего: {len(wl)}."
+    )
+
+
+@router.callback_query(F.data == "wl_fwd_no")
+async def cb_wl_fwd_no(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    await callback.answer("Ок")
+    await callback.message.edit_text("Ок, не добавляю.")
 
 
 # ─── Кнопка "Запрос" + свободные сообщения ───────────────────

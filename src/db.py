@@ -575,6 +575,31 @@ async def save_daily_summary(date, summary: str, stats: dict = None):
 
 # ─── Статистика ──────────────────────────────────────────────
 
+async def get_known_chats(exclude_private: bool = True) -> list:
+    """Возвращает уникальные чаты из БД (chat_id, chat_title, msg_count).
+    exclude_private=True убирает ЛС (chat_id == sender_id)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if exclude_private:
+            rows = await conn.fetch(
+                """SELECT chat_id, MAX(chat_title) as chat_title, COUNT(*) as msg_count
+                   FROM messages
+                   WHERE chat_id != sender_id
+                   GROUP BY chat_id
+                   ORDER BY msg_count DESC
+                   LIMIT 50"""
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT chat_id, MAX(chat_title) as chat_title, COUNT(*) as msg_count
+                   FROM messages
+                   GROUP BY chat_id
+                   ORDER BY msg_count DESC
+                   LIMIT 50"""
+            )
+        return [dict(r) for r in rows]
+
+
 async def get_db_stats() -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
