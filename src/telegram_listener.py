@@ -125,13 +125,18 @@ async def on_new_message(event):
         if _should_ignore(msg):
             return
 
+        # Фильтр: обрабатываем только whitelist-чаты
+        chat_id = msg.chat_id or 0
+        whitelist = await _get_whitelist()
+        if not whitelist or chat_id not in whitelist:
+            return  # Whitelist пустой или чат не в списке — игнорируем
+
         # Получаем информацию об отправителе
         sender = await msg.get_sender()
         chat = await msg.get_chat()
 
         sender_id = sender.id if sender else 0
         sender_name = _get_display_name(sender)
-        chat_id = msg.chat_id or 0
         chat_title = _get_chat_title(chat)
 
         # Определяем тип медиа
@@ -171,9 +176,8 @@ async def on_new_message(event):
                     contact_id=contact["id"],
                 )
 
-        # Классификация AI — только для whitelist-чатов
-        whitelist = await _get_whitelist()
-        if chat_id in whitelist and text and len(text) > 5:
+        # Классификация AI (whitelist уже проверен выше)
+        if text and len(text) > 5:
             if _classify_callback:
                 # Отправляем на классификацию (асинхронно, не блокируем)
                 asyncio.create_task(
