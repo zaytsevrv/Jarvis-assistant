@@ -1,0 +1,30 @@
+# Telegram
+telethon==1.36.0
+aiogram==3.13.1
+cryptg==0.4.0
+PySocks==1.7.1
+
+# Database
+asyncpg==0.30.0
+psycopg2-binary==2.9.9
+
+# AI
+anthropic==0.42.0
+
+# Scheduling
+apscheduler==3.10.4
+
+# Utils
+python-dotenv==1.0.1
+pytz==2024.2
+
+# Фаза 2
+# openai==1.58.0          # Whisper API
+# aiohttp==3.11.0         # HTTP requests
+# python-dateutil==2.9.0  # Date parsing
+
+# Фаза 3
+# openpyxl==3.1.5         # Excel
+# python-docx==1.1.2      # Word
+# pdfplumber==0.11.4      # PDF
+# yadisk==3.1.0           # Yandex.Disk
