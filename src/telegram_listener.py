@@ -177,15 +177,10 @@ async def on_new_message(event):
         if db_msg_id is None:
             return  # Дубликат — пропускаем
 
-        # Для личных чатов — тихо сохраняем, без AI и уведомлений
-        if is_private and not in_whitelist:
-            await mark_message_processed(db_msg_id)
-            return
+        # --- AI-классификация для whitelist-чатов и личных чатов ---
 
-        # --- Ниже только whitelist-чаты ---
-
-        # Проверка: новый контакт?
-        if sender_id and sender_id != config.TELEGRAM_OWNER_ID:
+        # Проверка: новый контакт? (только для whitelist)
+        if in_whitelist and sender_id and sender_id != config.TELEGRAM_OWNER_ID:
             is_known = await is_known_contact(sender_id)
             if not is_known:
                 contact = await get_or_create_contact(sender_id, sender_name)
@@ -196,7 +191,7 @@ async def on_new_message(event):
                     f"Чат: {chat_title}",
                 )
 
-        # Классификация AI
+        # Классификация AI — для whitelist и личных чатов
         if text and len(text) > 5:
             if _classify_callback:
                 asyncio.create_task(
