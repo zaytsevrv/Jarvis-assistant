@@ -429,6 +429,85 @@ async def cb_restart_module(callback: CallbackQuery):
         await send_to_owner(f"Ошибка: {e}")
 
 
+# ─── Whitelist чатов ──────────────────────────────────────────
+
+@router.message(Command("whitelist"))
+@owner_only
+async def cmd_whitelist(message: Message):
+    args = message.text.strip().split(maxsplit=1)
+    raw = await get_setting("whitelist", "[]")
+    try:
+        wl = json.loads(raw)
+    except json.JSONDecodeError:
+        wl = []
+
+    # /whitelist — показать список
+    if len(args) < 2:
+        if not wl:
+            await send_to_owner(
+                "Whitelist пуст — listener не мониторит ни один чат.\n\n"
+                "Добавить: /whitelist add <chat_id>\n"
+                "Удалить: /whitelist del <chat_id>\n"
+                "Очистить: /whitelist clear\n\n"
+                "Узнать chat_id: перешли сообщение из чата боту @getmyid_bot"
+            )
+        else:
+            lines = [f"Whitelist ({len(wl)} чатов):"]
+            for cid in wl:
+                lines.append(f"  • {cid}")
+            lines.append(f"\nУдалить: /whitelist del <chat_id>")
+            await send_to_owner("\n".join(lines))
+        return
+
+    subcmd = args[1].strip()
+
+    # /whitelist clear
+    if subcmd == "clear":
+        await set_setting("whitelist", "[]")
+        await send_to_owner("Whitelist очищен. Listener больше ничего не мониторит.")
+        return
+
+    # /whitelist add <id> или /whitelist del <id>
+    parts = subcmd.split(maxsplit=1)
+    if len(parts) < 2 or parts[0] not in ("add", "del"):
+        await send_to_owner("Формат: /whitelist add <chat_id> или /whitelist del <chat_id>")
+        return
+
+    action = parts[0]
+    # Поддержка нескольких ID через пробел или запятую
+    raw_ids = parts[1].replace(",", " ").split()
+    added, removed, errors = [], [], []
+
+    for raw_id in raw_ids:
+        try:
+            chat_id = int(raw_id.strip())
+        except ValueError:
+            errors.append(raw_id)
+            continue
+
+        if action == "add":
+            if chat_id not in wl:
+                wl.append(chat_id)
+                added.append(str(chat_id))
+        elif action == "del":
+            if chat_id in wl:
+                wl.remove(chat_id)
+                removed.append(str(chat_id))
+
+    await set_setting("whitelist", json.dumps(wl))
+
+    result = []
+    if added:
+        result.append(f"Добавлено: {', '.join(added)}")
+    if removed:
+        result.append(f"Удалено: {', '.join(removed)}")
+    if errors:
+        result.append(f"Ошибка (не число): {', '.join(errors)}")
+    result.append(f"Всего в whitelist: {len(wl)}")
+
+    await send_to_owner("\n".join(result))
+
+
 # ─── Кнопка "Запрос" + свободные сообщения ───────────────────
 
 @router.message(F.text == "Запрос")

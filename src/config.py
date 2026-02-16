@@ -69,9 +69,9 @@ LOGS_DIR = BASE_DIR / "logs"
 HEARTBEAT_INTERVAL_SEC = 300        # 5 минут
 CONFIDENCE_HIGH = 80                # >80% — молча создаёт
 CONFIDENCE_LOW = 50                 # <50% — молча в info
-CONFIDENCE_BATCH_HOUR = 16          # 16:00 МСК
+CONFIDENCE_BATCH_HOUR = 13          # 13:00 МСК = 17:00 МСК+4
 CONFIDENCE_DAILY_LIMIT = 10         # макс вопросов/день
-BRIEFING_HOUR = 8                   # 08:00 МСК
-DIGEST_HOUR = 20                    # 20:00 МСК
+BRIEFING_HOUR = 5                    # 05:00 МСК = 09:00 МСК+4
+DIGEST_HOUR = 17                    # 17:00 МСК = 21:00 МСК+4
 WEEKLY_ANALYSIS_DAY = "sun"         # Воскресенье
-WEEKLY_ANALYSIS_HOUR = 10           # 10:00 МСК
+WEEKLY_ANALYSIS_HOUR = 6            # 06:00 МСК = 10:00 МСК+4

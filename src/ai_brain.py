@@ -154,6 +154,7 @@ class AIBrain:
             "model": model_id,
             "max_tokens": max_tokens,
             "messages": messages,
+            "temperature": 0.4,
         }
         if system_prompt:
             kwargs["system"] = system_prompt
@@ -170,7 +171,7 @@ class AIBrain:
 
     def _resolve_model_api(self, model: str) -> str:
         mapping = {
-            "haiku": "claude-haiku-4-5-20250514",
+            "haiku": "claude-haiku-4-5-20251001",
             "sonnet": "claude-sonnet-4-20250514",
             "opus": "claude-opus-4-20250514",
         }
@@ -178,7 +179,7 @@ class AIBrain:
 
     def _calc_cost(self, model_id: str, input_tokens: int, output_tokens: int) -> float:
         prices = {
-            "claude-haiku-4-5-20250514": (1.0, 5.0),
+            "claude-haiku-4-5-20251001": (0.80, 4.0),
             "claude-sonnet-4-20250514": (3.0, 15.0),
             "claude-opus-4-20250514": (15.0, 75.0),
         }
@@ -292,7 +293,13 @@ class AIBrain:
     # ─── Свободный вопрос по памяти ──────────────────────────
 
     async def answer_query(self, question: str, context: str) -> str:
-        system_prompt = "Ты — Jarvis, персональный ассистент. Отвечай кратко, по-русски, деловым тоном. Если в контексте нет ответа — скажи честно. Не выдумывай."
+        system_prompt = (
+            "Ты — Jarvis, персональный ассистент и напарник. "
+            "Общайся на ты, дружелюбно, без формальностей — как надёжный коллега. "
+            "Можешь шутить и подбадривать, но по делу будь точным. "
+            "Отвечай по-русски, кратко, по существу. "
+            "Если в контексте нет ответа — скажи честно. Не выдумывай и не додумывай факты."
+        )
 
         user_prompt = f"""КОНТЕКСТ (данные из памяти):
 {context}
@@ -310,7 +317,7 @@ class AIBrain:
     # ─── Утренний брифинг ────────────────────────────────────
 
     async def generate_briefing(self, data: dict) -> str:
-        prompt = f"""Сгенерируй утренний брифинг на основе данных. Формат — как в примере.
+        prompt = f"""Сгенерируй утренний брифинг. Стиль — дружелюбный напарник, на ты. Можешь добавить лёгкую шутку или мотивацию.
 
 Данные:
 - Задачи: {json.dumps(data.get('tasks', []), ensure_ascii=False)}
@@ -318,19 +325,19 @@ class AIBrain:
 - Дедлайны скоро: {json.dumps(data.get('deadlines', []), ensure_ascii=False)}
 
 Формат:
-Доброе утро. Вот что на сегодня:
+Привет! Вот что на сегодня:
 
 ЗАДАЧИ: X активных (Y срочных)
 ...
 
-Кратко, без воды."""
+Кратко, по делу, но с настроением."""
 
         return await self.ask(prompt, model="sonnet")
 
     # ─── Вечерний дайджест ───────────────────────────────────
 
     async def generate_digest(self, data: dict) -> str:
-        prompt = f"""Сгенерируй вечерний дайджест дня. Кратко, деловой тон, по-русски.
+        prompt = f"""Сгенерируй вечерний дайджест дня. Стиль — дружелюбный напарник, на ты. Подведи итог с лёгким позитивом.
 
 Данные:
 - Выполнено задач: {data.get('completed', 0)}
@@ -345,7 +352,7 @@ class AIBrain:
 ВЫПОЛНЕНО: X | В РАБОТЕ: Y | НОВЫХ: Z
 ...
 
-Спокойной ночи."""
+Хорошего вечера!"""
 
         return await self.ask(prompt, model="sonnet")
 
