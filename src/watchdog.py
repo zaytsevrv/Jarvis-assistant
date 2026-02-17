@@ -23,6 +23,9 @@ MAX_MISSED_HEARTBEATS = 3  # 3 * 5 мин = 15 мин
 _alert_counts: dict[str, int] = {}
 # Модули, которые уже были "down" на прошлой проверке
 _known_down: set[str] = set()
+# Время старта watchdog — первые 20 мин не алертим (grace period после перезапуска)
+_start_time: datetime | None = None
+GRACE_PERIOD_SEC = 20 * 60  # 20 минут
 
 # Библиотека типичных ошибок и инструкций
 ERROR_INSTRUCTIONS = {
@@ -89,7 +92,9 @@ async def notify_owner(text: str, **kwargs):
 # ─── Основной цикл мониторинга ───────────────────────────────
 
 async def start_watchdog():
-    logger.info("Watchdog запущен")
+    global _start_time
+    _start_time = datetime.now(timezone.utc)
+    logger.info("Watchdog запущен (grace period 20 мин)")
     while True:
         try:
             await _check_all_modules()
@@ -100,8 +105,13 @@ async def start_watchdog():
 
 
 async def _check_all_modules():
-    health = await get_module_health()
     now = datetime.now(timezone.utc)
+
+    # Grace period — не алертим сразу после перезапуска
+    if _start_time and (now - _start_time).total_seconds() < GRACE_PERIOD_SEC:
+        return
+
+    health = await get_module_health()
 
     for module_name in MONITORED_MODULES:
         # Ищем последний heartbeat для этого модуля
