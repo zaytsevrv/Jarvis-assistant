@@ -1060,8 +1060,7 @@ async def handle_photo(message: Message):
             context=context,
             system_context=system_context,
         )
-        footer = await _mode_footer()
-        await send_to_owner(html_lib.escape(answer) + footer)
+        await send_to_owner(html_lib.escape(answer))
     except Exception as e:
         logger.error(f"Vision error: {e}", exc_info=True)
         await send_to_owner(f"Не удалось проанализировать изображение: {html_lib.escape(str(e))}")
@@ -1118,9 +1117,8 @@ async def handle_free_text(message: Message):
             tool_calls=result.get("tool_calls"),
         )
 
-        # 7. Отправляем ответ с футером
-        footer = await _mode_footer()
-        await send_to_owner(answer_text + footer)
+        # 7. Отправляем ответ
+        await send_to_owner(answer_text)
 
     except Exception as e:
         logger.error(f"handle_free_text error: {e}", exc_info=True)
