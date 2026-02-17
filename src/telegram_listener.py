@@ -150,6 +150,15 @@ async def on_new_message(event):
         sender_name = _get_display_name(sender)
         chat_title = _get_chat_title(chat)
 
+        # Фильтр ботов — не сохраняем сообщения от ботов в ЛС
+        if is_private and getattr(sender, 'bot', False):
+            return
+
+        # Фильтр blacklist — полностью игнорируем
+        blacklist = await _get_blacklist()
+        if chat_id in blacklist or sender_id in blacklist:
+            return
+
         # Определяем тип медиа
         media_type = _get_media_type(msg)
 
@@ -257,6 +266,15 @@ def _get_media_type(msg) -> str | None:
 
 async def _get_whitelist() -> set:
     raw = await get_setting("whitelist", "[]")
+    try:
+        ids = json.loads(raw)
+        return set(ids)
+    except json.JSONDecodeError:
+        return set()
+
+
+async def _get_blacklist() -> set:
+    raw = await get_setting("blacklist", "[]")
     try:
         ids = json.loads(raw)
         return set(ids)

@@ -1,7 +1,7 @@
 import asyncpg
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -264,21 +264,43 @@ async def get_messages_since(since: datetime, chat_ids: list = None, limit: int 
 
 
 async def get_dm_summary_data(since: datetime, limit: int = 100) -> list:
-    """Получает ЛС-сообщения за период (sender_id != owner), сгруппированные по отправителю."""
+    """Получает ЛС-сообщения за период (без owner, без blacklist), сгруппированные по отправителю."""
     pool = await get_pool()
+    import json as _json
+    raw_bl = await get_setting("blacklist", "[]")
+    try:
+        bl_ids = _json.loads(raw_bl)
+    except _json.JSONDecodeError:
+        bl_ids = []
+
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT sender_name, COUNT(*) as msg_count,
-                      STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
-               FROM messages
-               WHERE timestamp >= $1
-                 AND sender_id != $2
-                 AND chat_id = sender_id
-               GROUP BY sender_name
-               ORDER BY msg_count DESC
-               LIMIT $3""",
-            since, 0, limit  # sender_id != 0 фильтрует системные
-        )
+        if bl_ids:
+            rows = await conn.fetch(
+                """SELECT sender_name, COUNT(*) as msg_count,
+                          STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
+                   FROM messages
+                   WHERE timestamp >= $1
+                     AND sender_id != $2
+                     AND sender_id != ALL($3::bigint[])
+                     AND chat_id = sender_id
+                   GROUP BY sender_name
+                   ORDER BY msg_count DESC
+                   LIMIT $4""",
+                since, config.TELEGRAM_OWNER_ID, bl_ids, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT sender_name, COUNT(*) as msg_count,
+                          STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
+                   FROM messages
+                   WHERE timestamp >= $1
+                     AND sender_id != $2
+                     AND chat_id = sender_id
+                   GROUP BY sender_name
+                   ORDER BY msg_count DESC
+                   LIMIT $3""",
+                since, config.TELEGRAM_OWNER_ID, limit,
+            )
         return [dict(r) for r in rows]
 
 
@@ -346,24 +368,38 @@ async def build_context(query: str, max_chars: int = 50000) -> str:
     """Собирает релевантный контекст для AI-запроса.
 
     Стратегия:
-    1. FTS по ключевым словам
-    2. Поиск по sender_name если есть имена
-    3. Активные задачи
-    4. Дедупликация и лимит по символам
+    1. Свежие ЛС (всегда, 12ч)
+    2. FTS по ключевым словам (без owner/ботов)
+    3. Поиск по sender_name если есть имена
+    4. Активные задачи
+    5. Дедупликация и лимит по символам
     """
     parts = []
     used_chars = 0
 
-    # 1. FTS поиск по ключевым словам
+    # 1. Свежие ЛС — всегда добавляем
+    since = datetime.now(timezone.utc) - timedelta(hours=12)
+    dm_data = await get_dm_summary_data(since, limit=20)
+    if dm_data:
+        dm_lines = ["СВЕЖИЕ ЛС (за 12ч):"]
+        for d in dm_data[:15]:
+            dm_lines.append(f"  {d['sender_name']} ({d['msg_count']} сообщ.): {d['previews'][:200]}")
+        dm_text = "\n".join(dm_lines)
+        parts.append(dm_text)
+        used_chars += len(dm_text)
+
+    # 2. FTS поиск по ключевым словам
     keywords = _extract_keywords(query)
     if keywords:
         fts_results = await search_messages(" ".join(keywords), limit=30)
+        # Фильтруем owner и подозрительных ботов
+        fts_results = [m for m in fts_results if m.get("sender_id") != config.TELEGRAM_OWNER_ID]
         fts_text = _format_messages(fts_results, "РЕЛЕВАНТНЫЕ СООБЩЕНИЯ:")
         if fts_text:
             parts.append(fts_text)
             used_chars += len(fts_text)
 
-    # 2. Поиск по именам
+    # 3. Поиск по именам
     names = _extract_names(query)
     for name in names[:3]:  # максимум 3 имени
         if used_chars >= max_chars * 0.7:
@@ -374,7 +410,7 @@ async def build_context(query: str, max_chars: int = 50000) -> str:
             parts.append(sender_text)
             used_chars += len(sender_text)
 
-    # 3. Активные задачи
+    # 4. Активные задачи
     tasks = await get_active_tasks()
     if tasks:
         task_lines = ["АКТИВНЫЕ ЗАДАЧИ:"]
@@ -399,6 +435,20 @@ async def build_context(query: str, max_chars: int = 50000) -> str:
 
 # ─── Задачи ──────────────────────────────────────────────────
 
+async def has_similar_active_task(description: str) -> bool:
+    """Проверяет, есть ли уже активная задача с похожим описанием."""
+    pool = await get_pool()
+    short = description[:50].strip()
+    if not short:
+        return False
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE status = 'active' AND description ILIKE '%' || $1 || '%')",
+            short,
+        )
+        return exists
+
+
 async def create_task(
     task_type: str,
     description: str,
@@ -408,7 +458,13 @@ async def create_task(
     source: Optional[str] = None,
     source_msg_id: Optional[int] = None,
     chat_id: Optional[int] = None,
-) -> int:
+) -> Optional[int]:
+    """Создаёт задачу. Возвращает id или None если дубликат."""
+    # Дедупликация
+    if await has_similar_active_task(description):
+        logger.info(f"Дубль задачи пропущен: {description[:60]}")
+        return None
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(

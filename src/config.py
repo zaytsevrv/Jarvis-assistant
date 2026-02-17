@@ -65,13 +65,17 @@ CALLS_PROCESSED_DIR = DATA_DIR / "calls" / "processed"
 COLD_ARCHIVE_DIR = DATA_DIR / "cold"
 LOGS_DIR = BASE_DIR / "logs"
 
+# === Часовой пояс владельца ===
+USER_TIMEZONE_OFFSET = 7            # UTC+7
+USER_TIMEZONE_NAME = "Красноярск"
+
 # === Константы ===
 HEARTBEAT_INTERVAL_SEC = 300        # 5 минут
 CONFIDENCE_HIGH = 80                # >80% — молча создаёт
 CONFIDENCE_LOW = 50                 # <50% — молча в info
-CONFIDENCE_BATCH_HOUR = 13          # 13:00 МСК = 17:00 МСК+4
+CONFIDENCE_BATCH_HOUR = 10          # 10:00 UTC = 17:00 Красноярск
 CONFIDENCE_DAILY_LIMIT = 10         # макс вопросов/день
-BRIEFING_HOUR = 5                    # 05:00 МСК = 09:00 МСК+4
-DIGEST_HOUR = 17                    # 17:00 МСК = 21:00 МСК+4
+BRIEFING_HOUR = 2                   # 02:00 UTC = 09:00 Красноярск
+DIGEST_HOUR = 14                    # 14:00 UTC = 21:00 Красноярск
 WEEKLY_ANALYSIS_DAY = "sun"         # Воскресенье
-WEEKLY_ANALYSIS_HOUR = 6            # 06:00 МСК = 10:00 МСК+4
+WEEKLY_ANALYSIS_HOUR = 3            # 03:00 UTC = 10:00 Красноярск

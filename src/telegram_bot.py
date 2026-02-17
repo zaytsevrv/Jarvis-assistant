@@ -1,8 +1,10 @@
 import asyncio
+import base64
+import io
 import json
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
@@ -20,6 +22,7 @@ from src.db import (
     build_context,
     get_active_tasks,
     get_db_stats,
+    get_dm_summary_data,
     get_known_chats,
     get_module_health,
     get_setting,
@@ -44,6 +47,11 @@ dp.include_router(router)
 
 
 # ─── Утилиты ─────────────────────────────────────────────────
+
+def _now_local() -> datetime:
+    """Текущее время в часовом поясе владельца (Красноярск UTC+7)."""
+    return datetime.now(timezone.utc) + timedelta(hours=config.USER_TIMEZONE_OFFSET)
+
 
 def owner_only(handler):
     """Декоратор: только владелец может использовать."""
@@ -150,10 +158,13 @@ async def cmd_help(message: Message):
         "/tasks     — активные задачи с дедлайнами\n"
         "/summary   — краткое содержание дня\n"
         "/health    — статус системы и модулей\n"
+        "/whitelist — чаты для мониторинга\n"
+        "/blacklist — исключения из мониторинга\n"
         "/admin     — управление: перезапуск, логи, бэкап\n"
         "/mode      — AI-режим (CLI/API), переключение\n"
         "/settings  — настройки (лимиты, whitelist, расписание)\n"
         "/help      — эта справка\n\n"
+        "ФОТО: отправь скриншот — проанализирую содержимое\n\n"
         "ТЕКСТОМ (без команд):\n"
         "\"Переключи на API\" — смена AI-режима\n"
         "Любой вопрос — Jarvis поймёт контекст"
@@ -215,7 +226,8 @@ async def cmd_health(message: Message):
     health = await get_module_health()
     stats = await get_db_stats()
 
-    lines = [f"Статус ({datetime.now().strftime('%H:%M')} МСК):\n"]
+    now = _now_local()
+    lines = [f"Статус ({now.strftime('%H:%M')} {config.USER_TIMEZONE_NAME}):\n"]
 
     for h in health:
         status = "OK" if h["status"] == "ok" else "FAIL"
@@ -281,7 +293,7 @@ async def cmd_settings(message: Message):
         f"НАСТРОЙКИ:\n\n"
         f"AI-режим: {mode}\n"
         f"Confidence лимит: {limit}/день\n"
-        f"Confidence батч: {batch_hour}:00 МСК\n"
+        f"Confidence батч: 17:00 {config.USER_TIMEZONE_NAME}\n"
         f"Whitelist чатов: {len(wl_list)}\n"
     )
     await send_to_owner(text)
@@ -444,9 +456,13 @@ async def cmd_whitelist(message: Message):
     if len(args) < 2:
         lines = []
         if wl:
+            known = await get_known_chats(exclude_private=True)
+            chat_map = {c["chat_id"]: c["chat_title"] for c in known}
             lines.append(f"Whitelist ({len(wl)} чатов):")
             for cid in wl:
-                lines.append(f"  • {cid}")
+                name = chat_map.get(cid, "")
+                label = f"{cid} ({name})" if name else str(cid)
+                lines.append(f"  • {label}")
         else:
             lines.append("Whitelist пуст.")
 
@@ -712,12 +728,263 @@ async def cb_wl_fwd_no(callback: CallbackQuery):
     await callback.message.edit_text("Ок, не добавляю.")
 
 
+# ─── Blacklist ────────────────────────────────────────────────
+
+@router.message(Command("blacklist"))
+@owner_only
+async def cmd_blacklist(message: Message):
+    args = message.text.strip().split(maxsplit=1)
+    raw = await get_setting("blacklist", "[]")
+    try:
+        bl = json.loads(raw)
+    except json.JSONDecodeError:
+        bl = []
+
+    if len(args) < 2:
+        lines = []
+        if bl:
+            known = await get_known_chats(exclude_private=False)
+            chat_map = {c["chat_id"]: c["chat_title"] for c in known}
+            lines.append(f"Blacklist ({len(bl)} записей):")
+            for cid in bl:
+                name = chat_map.get(cid, "")
+                label = f"{cid} ({name})" if name else str(cid)
+                lines.append(f"  • {label}")
+        else:
+            lines.append("Blacklist пуст.")
+
+        lines.append("\nДобавить: /blacklist add <id>\nУдалить: /blacklist del <id>")
+
+        buttons = [[InlineKeyboardButton(text="Управление", callback_data="bl_manage")]]
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await send_to_owner("\n".join(lines), reply_markup=markup)
+        return
+
+    subcmd = args[1].strip()
+
+    if subcmd == "clear":
+        await set_setting("blacklist", "[]")
+        await send_to_owner("Blacklist очищен.")
+        return
+
+    parts = subcmd.split(maxsplit=1)
+    if len(parts) < 2 or parts[0] not in ("add", "del"):
+        await send_to_owner("Формат: /blacklist add <id> или /blacklist del <id>")
+        return
+
+    action = parts[0]
+    raw_ids = parts[1].replace(",", " ").split()
+    added, removed, errors = [], [], []
+
+    for raw_id in raw_ids:
+        try:
+            item_id = int(raw_id.strip())
+        except ValueError:
+            errors.append(raw_id)
+            continue
+
+        if action == "add":
+            if item_id not in bl:
+                bl.append(item_id)
+                added.append(str(item_id))
+        elif action == "del":
+            if item_id in bl:
+                bl.remove(item_id)
+                removed.append(str(item_id))
+
+    await set_setting("blacklist", json.dumps(bl))
+
+    result = []
+    if added:
+        result.append(f"Заблокировано: {', '.join(added)}")
+    if removed:
+        result.append(f"Разблокировано: {', '.join(removed)}")
+    if errors:
+        result.append(f"Ошибка (не число): {', '.join(errors)}")
+    result.append(f"Всего в blacklist: {len(bl)}")
+
+    await send_to_owner("\n".join(result))
+
+
+@router.callback_query(F.data == "bl_manage")
+async def cb_bl_manage(callback: CallbackQuery):
+    """Показать известные чаты/контакты для добавления в blacklist."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+
+    raw = await get_setting("blacklist", "[]")
+    try:
+        bl = json.loads(raw)
+    except json.JSONDecodeError:
+        bl = []
+
+    # Показываем все известные чаты (включая ЛС)
+    known = await get_known_chats(exclude_private=False)
+    if not known:
+        await callback.answer("Пока нет известных чатов в БД")
+        return
+
+    buttons = []
+    row = []
+    for chat in known[:12]:
+        cid = chat["chat_id"]
+        title = chat["chat_title"] or str(cid)
+        short = title[:18] if len(title) <= 18 else title[:16] + ".."
+        if cid in bl:
+            row.append(InlineKeyboardButton(text=f"✅ {short}", callback_data=f"bl_del:{cid}"))
+        else:
+            row.append(InlineKeyboardButton(text=f"🚫 {short}", callback_data=f"bl_add:{cid}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    if bl:
+        buttons.append([InlineKeyboardButton(text="Очистить blacklist", callback_data="bl_clear")])
+    buttons.append([InlineKeyboardButton(text="Закрыть", callback_data="bl_close")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text(
+        f"Blacklist: {len(bl)}. 🚫 = заблокировать, ✅ = разблокировать:",
+        reply_markup=markup,
+    )
+
+
+@router.callback_query(F.data.startswith("bl_add:"))
+async def cb_bl_add(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    item_id = int(callback.data.split(":")[1])
+    raw = await get_setting("blacklist", "[]")
+    try:
+        bl = json.loads(raw)
+    except json.JSONDecodeError:
+        bl = []
+
+    if item_id not in bl:
+        bl.append(item_id)
+        await set_setting("blacklist", json.dumps(bl))
+        await callback.answer(f"Заблокирован: {item_id}")
+    else:
+        await callback.answer("Уже в blacklist")
+
+    await _refresh_bl_manage(callback.message, bl)
+
+
+@router.callback_query(F.data.startswith("bl_del:"))
+async def cb_bl_del(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    item_id = int(callback.data.split(":")[1])
+    raw = await get_setting("blacklist", "[]")
+    try:
+        bl = json.loads(raw)
+    except json.JSONDecodeError:
+        bl = []
+
+    if item_id in bl:
+        bl.remove(item_id)
+        await set_setting("blacklist", json.dumps(bl))
+        await callback.answer(f"Разблокирован: {item_id}")
+    else:
+        await callback.answer("Не было в blacklist")
+
+    await _refresh_bl_manage(callback.message, bl)
+
+
+@router.callback_query(F.data == "bl_clear")
+async def cb_bl_clear(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    await set_setting("blacklist", "[]")
+    await callback.answer("Blacklist очищен")
+    await callback.message.edit_text("Blacklist очищен.")
+
+
+@router.callback_query(F.data == "bl_close")
+async def cb_bl_close(callback: CallbackQuery):
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    raw = await get_setting("blacklist", "[]")
+    try:
+        bl = json.loads(raw)
+    except json.JSONDecodeError:
+        bl = []
+    await callback.message.edit_text(f"Blacklist: {len(bl)} записей.")
+
+
+async def _refresh_bl_manage(message, bl: list):
+    """Перерисовать кнопки управления blacklist."""
+    known = await get_known_chats(exclude_private=False)
+    buttons = []
+    row = []
+    for chat in known[:12]:
+        cid = chat["chat_id"]
+        title = chat["chat_title"] or str(cid)
+        short = title[:18] if len(title) <= 18 else title[:16] + ".."
+        if cid in bl:
+            row.append(InlineKeyboardButton(text=f"✅ {short}", callback_data=f"bl_del:{cid}"))
+        else:
+            row.append(InlineKeyboardButton(text=f"🚫 {short}", callback_data=f"bl_add:{cid}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    if bl:
+        buttons.append([InlineKeyboardButton(text="Очистить blacklist", callback_data="bl_clear")])
+    buttons.append([InlineKeyboardButton(text="Закрыть", callback_data="bl_close")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await message.edit_text(
+            f"Blacklist: {len(bl)}. 🚫 = заблокировать, ✅ = разблокировать:",
+            reply_markup=markup,
+        )
+    except Exception:
+        pass
+
+
 # ─── Кнопка "Запрос" + свободные сообщения ───────────────────
 
 @router.message(F.text == "Запрос")
 @owner_only
 async def btn_query(message: Message):
     await message.answer("Что хочешь узнать? Пиши вопрос.")
+
+
+@router.message(F.photo)
+@owner_only
+async def handle_photo(message: Message):
+    """Обработка фото — Claude Vision."""
+    await message.answer("Анализирую изображение...")
+
+    # Скачиваем фото (максимальное разрешение)
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file.file_path, buf)
+    image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    question = message.caption.strip() if message.caption else "Опиши и проанализируй что на этом изображении. Если это счёт, штраф, документ — выдели ключевые данные (суммы, даты, реквизиты)."
+
+    system_context = await _build_system_context()
+    context = await build_context(question) if message.caption else ""
+
+    try:
+        answer = await brain.answer_query_with_image(
+            question=question,
+            image_base64=image_b64,
+            media_type="image/jpeg",
+            context=context,
+            system_context=system_context,
+        )
+        await send_to_owner(answer)
+    except Exception as e:
+        logger.error(f"Vision error: {e}", exc_info=True)
+        await send_to_owner(f"Не удалось проанализировать изображение: {e}")
 
 
 @router.message(F.text)
@@ -740,11 +1007,46 @@ async def handle_free_text(message: Message):
     # Свободный запрос к AI
     await message.answer("Ищу...")
 
-    # Сборка контекста: FTS + поиск по именам + активные задачи
     context = await build_context(text)
+    system_context = await _build_system_context()
 
-    answer = await brain.answer_query(text, context)
+    answer = await brain.answer_query(text, context, system_context=system_context)
     await send_to_owner(answer)
+
+
+async def _build_system_context() -> str:
+    """Собирает динамический контекст для system prompt AI."""
+    parts = []
+
+    # Whitelist с названиями
+    raw_wl = await get_setting("whitelist", "[]")
+    try:
+        wl_ids = json.loads(raw_wl)
+    except json.JSONDecodeError:
+        wl_ids = []
+
+    if wl_ids:
+        known = await get_known_chats(exclude_private=True)
+        chat_map = {c["chat_id"]: c["chat_title"] for c in known}
+        wl_names = [chat_map.get(cid, str(cid)) for cid in wl_ids]
+        parts.append(f"Мониторинг: {len(wl_ids)} групп в whitelist ({', '.join(wl_names)}) + все личные чаты (кроме ботов).")
+    else:
+        parts.append("Мониторинг: whitelist пуст, только личные чаты (кроме ботов).")
+
+    # Статистика
+    stats = await get_db_stats()
+    parts.append(f"В памяти: {stats.get('messages', 0)} сообщений, {stats.get('active_tasks', 0)} активных задач.")
+
+    # Свежие ЛС
+    since = datetime.now(timezone.utc) - timedelta(hours=12)
+    dm_data = await get_dm_summary_data(since)
+    if dm_data:
+        dm_lines = [f"{d['sender_name']} ({d['msg_count']} сообщ.)" for d in dm_data[:10]]
+        parts.append(f"Свежие ЛС за 12ч: {', '.join(dm_lines)}.")
+
+    parts.append("Ты имеешь полный доступ к базе данных сообщений. Если знаешь ответ из контекста — отвечай уверенно.")
+
+    return "\n".join(parts)
 
 
 # ─── Запуск бота ─────────────────────────────────────────────

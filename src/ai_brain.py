@@ -3,7 +3,7 @@ import json
 import logging
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import anthropic
@@ -292,14 +292,23 @@ class AIBrain:
 
     # ─── Свободный вопрос по памяти ──────────────────────────
 
-    async def answer_query(self, question: str, context: str) -> str:
+    def _now_local(self) -> datetime:
+        """Текущее время в часовом поясе владельца."""
+        return datetime.now(timezone.utc) + timedelta(hours=config.USER_TIMEZONE_OFFSET)
+
+    async def answer_query(self, question: str, context: str, system_context: str = "") -> str:
+        now = self._now_local()
         system_prompt = (
             "Ты — Jarvis, персональный ассистент и напарник. "
             "Общайся на ты, дружелюбно, без формальностей — как надёжный коллега. "
             "Можешь шутить и подбадривать, но по делу будь точным. "
             "Отвечай по-русски, кратко, по существу. "
-            "Если в контексте нет ответа — скажи честно. Не выдумывай и не додумывай факты."
+            "Если в контексте нет ответа — скажи честно. Не выдумывай и не додумывай факты.\n\n"
+            f"Сегодня: {now.strftime('%d.%m.%Y')}. Время: {now.strftime('%H:%M')} ({config.USER_TIMEZONE_NAME}, UTC+{config.USER_TIMEZONE_OFFSET}).\n"
+            f"Расписание: утренний брифинг 09:00, вечерний дайджест 21:00 ({config.USER_TIMEZONE_NAME}).\n"
         )
+        if system_context:
+            system_prompt += system_context
 
         user_prompt = f"""КОНТЕКСТ (данные из памяти):
 {context}
@@ -314,10 +323,54 @@ class AIBrain:
             combined = f"{system_prompt}\n\n{user_prompt}"
             return await self.ask(combined, model="sonnet")
 
+    async def answer_query_with_image(
+        self, question: str, image_base64: str, media_type: str = "image/jpeg",
+        context: str = "", system_context: str = "",
+    ) -> str:
+        """Ответ на вопрос с изображением (Claude Vision)."""
+        now = self._now_local()
+        system_prompt = (
+            "Ты — Jarvis, персональный ассистент и напарник. "
+            "Общайся на ты, дружелюбно, без формальностей. "
+            "Отвечай по-русски, кратко, по существу.\n\n"
+            f"Сегодня: {now.strftime('%d.%m.%Y')}. Время: {now.strftime('%H:%M')} ({config.USER_TIMEZONE_NAME}).\n"
+        )
+        if system_context:
+            system_prompt += system_context
+
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}},
+        ]
+        if context:
+            content.append({"type": "text", "text": f"КОНТЕКСТ:\n{context}"})
+        content.append({"type": "text", "text": question})
+
+        if not self._api_client:
+            if not config.ANTHROPIC_API_KEY:
+                raise RuntimeError("Vision требует API-режим. ANTHROPIC_API_KEY не задан.")
+            self._api_client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+
+        model_id = self._resolve_model_api("sonnet")
+        response = await self._api_client.messages.create(
+            model=model_id,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=[{"role": "user", "content": content}],
+            temperature=0.4,
+        )
+        self._last_api_cost = self._calc_cost(
+            model_id, response.usage.input_tokens, response.usage.output_tokens,
+        )
+        return response.content[0].text
+
     # ─── Утренний брифинг ────────────────────────────────────
 
     async def generate_briefing(self, data: dict) -> str:
+        now = self._now_local()
+        today = now.strftime('%d.%m.%Y')
         prompt = f"""Сгенерируй утренний брифинг. Стиль — дружелюбный напарник, на ты. Можешь добавить лёгкую шутку или мотивацию.
+
+Сегодня: {today}
 
 Данные:
 - Задачи: {json.dumps(data.get('tasks', []), ensure_ascii=False)}
@@ -325,7 +378,7 @@ class AIBrain:
 - Дедлайны скоро: {json.dumps(data.get('deadlines', []), ensure_ascii=False)}
 
 Формат:
-Привет! Вот что на сегодня:
+Привет! Вот что на сегодня ({today}):
 
 ЗАДАЧИ: X активных (Y срочных)
 ...
@@ -337,7 +390,11 @@ class AIBrain:
     # ─── Вечерний дайджест ───────────────────────────────────
 
     async def generate_digest(self, data: dict) -> str:
+        now = self._now_local()
+        today = now.strftime('%d.%m.%Y')
         prompt = f"""Сгенерируй вечерний дайджест дня. Стиль — дружелюбный напарник, на ты. Подведи итог с лёгким позитивом.
+
+Сегодня: {today}
 
 Данные:
 - Выполнено задач: {data.get('completed', 0)}
@@ -347,7 +404,7 @@ class AIBrain:
 - Важные события: {json.dumps(data.get('events', []), ensure_ascii=False)}
 
 Формат:
-ИТОГ ДНЯ — [дата]
+ИТОГ ДНЯ — {today}
 
 ВЫПОЛНЕНО: X | В РАБОТЕ: Y | НОВЫХ: Z
 ...
@@ -371,7 +428,8 @@ class AIBrain:
             msgs_block = "\n".join(messages[:50])  # макс 50 сообщений на группу
             groups_text += f"\n\n--- Группа: {title} ({len(messages)} сообщ.) ---\n{msgs_block}"
 
-        prompt = f"""Проанализируй сообщения из рабочих групп за период. Стиль — дружелюбный напарник, на ты.
+        now = self._now_local()
+        prompt = f"""Проанализируй сообщения из рабочих групп за период. Дата: {now.strftime('%d.%m.%Y')}. Стиль — дружелюбный напарник, на ты.
 
 Для каждой группы:
 1. Выдели 2-3 ВАЖНЫХ сообщения/новости (если есть)
@@ -402,7 +460,8 @@ class AIBrain:
 
         dm_text = "\n".join(lines)
 
-        prompt = f"""Кратко перескажи кто писал в личные сообщения. Стиль — дружелюбный напарник, на ты.
+        now = self._now_local()
+        prompt = f"""Кратко перескажи кто писал в личные сообщения. Дата: {now.strftime('%d.%m.%Y')}. Стиль — дружелюбный напарник, на ты.
 Выдели: кто писал, сколько сообщений, о чём (1 предложение на человека).
 Если кто-то просил что-то или ставил задачу — подчеркни.
 

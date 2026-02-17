@@ -91,7 +91,7 @@ async def morning_briefing():
 
 
 async def confidence_batch():
-    """16:00 МСК — батч неуверенных классификаций."""
+    """17:00 Красноярск — батч неуверенных классификаций."""
     try:
         await send_batch_review()
     except Exception as e:
@@ -201,21 +201,21 @@ async def scheduler_heartbeat():
 
 async def start_scheduler():
     global scheduler
-    scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
+    scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # Утренний брифинг — 08:00
+    # Утренний брифинг — 02:00 UTC = 09:00 Красноярск
     scheduler.add_job(morning_briefing, CronTrigger(hour=config.BRIEFING_HOUR, minute=0))
 
-    # Батч confidence — 16:00
+    # Батч confidence — 10:00 UTC = 17:00 Красноярск
     scheduler.add_job(confidence_batch, CronTrigger(hour=config.CONFIDENCE_BATCH_HOUR, minute=0))
 
-    # Вечерний дайджест — 20:00
+    # Вечерний дайджест — 14:00 UTC = 21:00 Красноярск
     scheduler.add_job(evening_digest, CronTrigger(hour=config.DIGEST_HOUR, minute=0))
 
     # Проверка дедлайнов — каждый час
     scheduler.add_job(check_deadlines, CronTrigger(minute=30))
 
-    # Еженедельный анализ — воскресенье 10:00
+    # Еженедельный анализ — воскресенье 03:00 UTC = 10:00 Красноярск
     scheduler.add_job(weekly_analysis, CronTrigger(
         day_of_week=config.WEEKLY_ANALYSIS_DAY,
         hour=config.WEEKLY_ANALYSIS_HOUR,
