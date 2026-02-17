@@ -19,8 +19,10 @@ MONITORED_MODULES = [
 # Сколько пропущенных heartbeat = проблема
 MAX_MISSED_HEARTBEATS = 3  # 3 * 5 мин = 15 мин
 
-# Счётчик перезапусков (модуль → количество)
-_restart_counts: dict[str, int] = {}
+# Счётчик алертов (модуль → количество отправленных)
+_alert_counts: dict[str, int] = {}
+# Модули, которые уже были "down" на прошлой проверке
+_known_down: set[str] = set()
 
 # Библиотека типичных ошибок и инструкций
 ERROR_INSTRUCTIONS = {
@@ -123,21 +125,27 @@ async def _check_all_modules():
 
         if missed >= MAX_MISSED_HEARTBEATS:
             await _handle_module_down(module_name, module_health, missed)
+        else:
+            # Модуль жив — сбросить счётчик алертов если был down
+            if module_name in _known_down:
+                _known_down.discard(module_name)
+                _alert_counts.pop(module_name, None)
+                await notify_owner(f"Модуль {module_name} восстановился.")
 
-        elif module_health.get("status") == "error":
-            await _handle_module_error(module_name, module_health)
+            if module_health.get("status") == "error":
+                await _handle_module_error(module_name, module_health)
 
 
 async def _handle_module_down(module_name: str, health_info: dict, missed: int):
-    """Модуль не отвечает — уведомление + попытка перезапуска всего процесса."""
-    alert_count = _restart_counts.get(module_name, 0)
+    """Модуль не отвечает — уведомление (макс 3 раза, потом молчим до восстановления)."""
+    _known_down.add(module_name)
+    alert_count = _alert_counts.get(module_name, 0)
 
     if alert_count >= 3:
-        # Уже сообщали 3 раза — не спамим, сбрасываем счётчик
-        _restart_counts[module_name] = 0
+        # Уже сообщали 3 раза — молчим до восстановления модуля
         return
 
-    _restart_counts[module_name] = alert_count + 1
+    _alert_counts[module_name] = alert_count + 1
 
     error_text = health_info.get("error", "Неизвестная ошибка")
     instruction = _find_instruction(error_text)
@@ -162,7 +170,7 @@ async def _handle_module_down(module_name: str, health_info: dict, missed: int):
         f"Ошибка: \"{error_text}\"\n\n"
         f"{instruction}\n\n"
         f"{action_hint}\n\n"
-        f"Уведомление {alert_count + 1}/3. Или: скопируй ошибку в Claude Code."
+        f"Уведомление {alert_count + 1}/3 (больше не повторю до восстановления)."
     )
 
 
