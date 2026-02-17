@@ -234,10 +234,11 @@ class AIBrain:
     def _parse_classification(self, raw: str, original_text: str) -> dict:
         """Парсинг и валидация JSON-ответа классификации."""
         try:
-            clean = raw.strip()
-            if clean.startswith("```"):
-                clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0]
-            data = json.loads(clean)
+            # Ищем JSON-объект в ответе (устойчиво к markdown-обёрткам и лишнему тексту)
+            match = re.search(r'\{[\s\S]*\}', raw)
+            if not match:
+                raise json.JSONDecodeError("No JSON found", raw, 0)
+            data = json.loads(match.group())
         except json.JSONDecodeError:
             logger.warning(f"AI вернул невалидный JSON: {raw[:200]}")
             return self._default_classification(original_text)
@@ -297,6 +298,8 @@ class AIBrain:
         return datetime.now(timezone.utc) + timedelta(hours=config.USER_TIMEZONE_OFFSET)
 
     async def answer_query(self, question: str, context: str, system_context: str = "") -> str:
+        """Старый метод — оставлен для обратной совместимости (briefing/digest).
+        Для диалога с пользователем используй ask_with_tools()."""
         now = self._now_local()
         system_prompt = (
             "Ты — Jarvis, персональный ассистент и напарник. "
@@ -322,6 +325,215 @@ class AIBrain:
         else:
             combined = f"{system_prompt}\n\n{user_prompt}"
             return await self.ask(combined, model="sonnet")
+
+    # ─── Новый диалог с tool_use ──────────────────────────────
+
+    # Статическая часть system prompt (кешируется через prompt caching)
+    _EA_SYSTEM_PROMPT_STATIC = """ТЫ — JARVIS, ИСПОЛНИТЕЛЬНЫЙ ПОМОЩНИК РУКОВОДИТЕЛЯ (executive assistant)
+
+Ты не чат-бот и не поисковик. Ты — правая рука. Как живой помощник,
+который знает дела, помнит контекст и ДЕЛАЕТ, а не обсуждает.
+
+ПРИНЦИПЫ РАБОТЫ:
+
+1. АДЕКВАТНАЯ ПОДАЧА ИНФОРМАЦИИ
+   Глубина ответа должна соответствовать запросу:
+   - Подтверждение действия → 1 строка: "Готово, напомню 18.02 в 11:00"
+   - Список задач → структурированный список с датами
+   - Аналитика по чату/каналу → развёрнутый разбор с деталями, именами, цитатами
+   - Предупреждение о дедлайне → контекст + что именно горит
+   Не сжимай то, что нужно развернуть. Не раздувай то, что нужно сжать.
+   Принцип "перевёрнутая пирамида": главное первой строкой, детали ниже.
+
+2. ТОЧНОСТЬ ДАННЫХ
+   Даты, имена, суммы — БУКВАЛЬНО из источника.
+   - "18 февраля 2026г" → в задаче будет "18.02.2026", а не "середина февраля"
+   - НЕ пересказывай списки своими словами — копируй точно
+   - Если данных нет — скажи "не вижу в памяти", НЕ додумывай
+   - Числа, цены, сроки — только из источника, никогда от себя
+
+3. ДЕЙСТВИЕ > ОБСУЖДЕНИЕ
+   Если понятно что делать — ДЕЛАЙ (через tools), потом докладывай результат.
+   - "Напомни завтра в 11 про ремень" → create_task → "Готово, напомню 18.02 в 11:00"
+   - НЕ "Предлагаю план: 1) создать напоминание 2) настроить время..."
+   - Если не хватает данных — ОДИН конкретный вопрос, не три
+
+4. ПАМЯТЬ РАЗГОВОРА
+   Ты помнишь последние сообщения диалога.
+   - "Да" = подтверждение предыдущего. НЕ "Что именно 'да'?"
+   - "А третий пункт?" = ссылка на предыдущий список
+   - Никогда не переспрашивай то, что уже было сказано в диалоге
+
+5. КОНТЕКСТ ЭТОГО ЧАТА
+   Этот чат — управляющий канал между тобой и руководителем.
+   - Сообщения здесь НЕ идут в автоматическую классификацию
+   - Если руководитель делится информацией — ты понимаешь контекст,
+     но задачу создаёшь только по прямой просьбе: "запиши", "напомни", "зафиксируй"
+   - Если видишь что информация важная и стоит записать — СПРОСИ один раз:
+     "Зафиксировать как задачу?" Но не навязывай
+
+6. ФОРМАТИРОВАНИЕ
+   Используй HTML-разметку для Telegram:
+   - <b>жирный</b> для важного
+   - Списки через дефис или нумерацию
+   - НЕ используй Markdown (**, __, ```) — Telegram его не рендерит корректно
+   - Без лишних скобок, стрелочек, декоративных символов"""
+
+    def _build_ea_system_prompt(self, dynamic_context: str = "") -> list:
+        """Собирает system prompt из статической (кешируемой) и динамической частей.
+
+        Возвращает список блоков для Anthropic API system parameter.
+        Статическая часть помечена cache_control для prompt caching.
+        """
+        now = self._now_local()
+
+        # Статическая часть — кешируется (экономия до 90%)
+        blocks = [
+            {
+                "type": "text",
+                "text": self._EA_SYSTEM_PROMPT_STATIC,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ]
+
+        # Динамическая часть — меняется каждый запрос
+        dynamic = (
+            f"\nСегодня: {now.strftime('%d.%m.%Y')}. "
+            f"Время: {now.strftime('%H:%M')} ({config.USER_TIMEZONE_NAME}, UTC+{config.USER_TIMEZONE_OFFSET}).\n"
+            f"Расписание: утренний брифинг 09:00, вечерний дайджест 21:00 ({config.USER_TIMEZONE_NAME}).\n"
+        )
+        if dynamic_context:
+            dynamic += "\n" + dynamic_context
+
+        blocks.append({"type": "text", "text": dynamic})
+
+        return blocks
+
+    async def ask_with_tools(
+        self,
+        messages: list[dict],
+        dynamic_context: str = "",
+        max_tool_rounds: int = 5,
+    ) -> dict:
+        """Диалог с tool_use — основной метод для handle_free_text.
+
+        Args:
+            messages: история диалога [{role, content}, ...] (последние N)
+            dynamic_context: динамический контекст (whitelist, stats, DM)
+            max_tool_rounds: макс раундов tool call (защита от зацикливания)
+
+        Returns:
+            {
+                "text": "ответ модели",
+                "cost": float,
+                "tool_calls": [{"name": ..., "input": ..., "result": ...}],
+            }
+        """
+        from src.tools import TOOL_DEFINITIONS, execute_tool
+
+        # Всегда через API (tool_use не работает через CLI)
+        if not self._api_client:
+            if not config.ANTHROPIC_API_KEY:
+                raise RuntimeError("Tool use требует API-режим. ANTHROPIC_API_KEY не задан.")
+            self._api_client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+
+        model_id = self._resolve_model_api("sonnet")
+        system_blocks = self._build_ea_system_prompt(dynamic_context)
+
+        total_cost = 0.0
+        tool_calls_log = []
+
+        # Копируем messages чтобы не мутировать оригинал
+        conversation = list(messages)
+
+        for round_num in range(max_tool_rounds):
+            response = await self._api_client.messages.create(
+                model=model_id,
+                max_tokens=4096,
+                system=system_blocks,
+                messages=conversation,
+                tools=TOOL_DEFINITIONS,
+                temperature=0.4,
+            )
+
+            total_cost += self._calc_cost(
+                model_id,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+            )
+
+            # Проверяем stop_reason
+            if response.stop_reason == "end_turn":
+                # Модель закончила — собираем текст
+                text_parts = []
+                for block in response.content:
+                    if block.type == "text":
+                        text_parts.append(block.text)
+                self._last_api_cost = total_cost
+                return {
+                    "text": "\n".join(text_parts),
+                    "cost": total_cost,
+                    "tool_calls": tool_calls_log,
+                }
+
+            elif response.stop_reason == "tool_use":
+                # Модель хочет вызвать tool(s)
+                # Добавляем ответ модели в conversation
+                conversation.append({
+                    "role": "assistant",
+                    "content": [block.model_dump() for block in response.content],
+                })
+
+                # Обрабатываем каждый tool_use блок
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        tool_name = block.name
+                        tool_input = block.input
+                        logger.info(f"Tool call [{round_num+1}]: {tool_name}({json.dumps(tool_input, ensure_ascii=False)[:200]})")
+
+                        result_str = await execute_tool(tool_name, tool_input)
+
+                        tool_calls_log.append({
+                            "name": tool_name,
+                            "input": tool_input,
+                            "result": result_str[:500],
+                        })
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_str,
+                        })
+
+                # Добавляем результаты tools в conversation
+                conversation.append({
+                    "role": "user",
+                    "content": tool_results,
+                })
+
+            else:
+                # Неожиданный stop_reason
+                logger.warning(f"Неожиданный stop_reason: {response.stop_reason}")
+                text_parts = []
+                for block in response.content:
+                    if block.type == "text":
+                        text_parts.append(block.text)
+                self._last_api_cost = total_cost
+                return {
+                    "text": "\n".join(text_parts) or "(модель не дала ответа)",
+                    "cost": total_cost,
+                    "tool_calls": tool_calls_log,
+                }
+
+        # Превышен лимит раундов
+        logger.warning(f"ask_with_tools: превышен лимит {max_tool_rounds} раундов")
+        self._last_api_cost = total_cost
+        return {
+            "text": "(Превышен лимит обработки. Попробуй переформулировать.)",
+            "cost": total_cost,
+            "tool_calls": tool_calls_log,
+        }
 
     async def answer_query_with_image(
         self, question: str, image_base64: str, media_type: str = "image/jpeg",

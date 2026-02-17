@@ -208,9 +208,9 @@ async def send_batch_review():
 # ─── Обработка ответа пользователя ───────────────────────────
 
 async def resolve_batch_all_tasks(queue_ids: list[int]):
-    """Пользователь нажал 'Все задачи'."""
+    """Пользователь нажал 'Все задачи' — A4: реально создаём задачи."""
     for qid in queue_ids:
-        await resolve_confidence(qid, "task")
+        await _resolve_and_create(qid, "task")
     logger.info(f"Батч: все {len(queue_ids)} подтверждены как задачи")
 
 
@@ -222,6 +222,40 @@ async def resolve_batch_nothing(queue_ids: list[int]):
 
 
 async def resolve_single(queue_id: int, actual_type: str):
-    """Пользователь ответил на один вопрос."""
-    await resolve_confidence(queue_id, actual_type)
+    """Пользователь ответил на один вопрос — A4: создаём задачу если тип task."""
+    if actual_type in ("task", "promise_mine", "promise_incoming"):
+        await _resolve_and_create(queue_id, actual_type)
+    else:
+        await resolve_confidence(queue_id, actual_type)
     logger.info(f"Confidence #{queue_id} → {actual_type}")
+
+
+async def _resolve_and_create(queue_id: int, actual_type: str):
+    """Резолвит confidence и РЕАЛЬНО создаёт задачу в БД."""
+    from src.db import get_pool
+
+    # Получаем данные из confidence_queue
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT message_id, chat_id, sender_name, text_preview, predicted_type "
+            "FROM confidence_queue WHERE id = $1",
+            queue_id,
+        )
+
+    await resolve_confidence(queue_id, actual_type)
+
+    if row:
+        task_id = await create_task(
+            task_type=actual_type,
+            description=row["text_preview"] or f"Задача от {row['sender_name']}",
+            who=row["sender_name"] if actual_type == "promise_incoming" else None,
+            confidence=100,  # Подтверждено пользователем
+            source=f"confidence:{queue_id}",
+            source_msg_id=row["message_id"],
+            chat_id=row["chat_id"],
+        )
+        if task_id:
+            logger.info(f"Задача #{task_id} создана из confidence #{queue_id}")
+        else:
+            logger.info(f"Дубль задачи из confidence #{queue_id}")

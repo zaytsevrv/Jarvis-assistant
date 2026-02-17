@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
@@ -33,6 +34,9 @@ _clients: list[TelegramClient] = []
 _notify_callback = None
 _classify_callback = None
 
+# ID бота — определяется при старте, используется для фильтрации
+_bot_id: int = 0
+
 
 def set_notify_callback(callback):
     global _notify_callback
@@ -42,6 +46,12 @@ def set_notify_callback(callback):
 def set_classify_callback(callback):
     global _classify_callback
     _classify_callback = callback
+
+
+def set_bot_id(bot_id: int):
+    """Устанавливает ID бота для фильтрации classify pipeline."""
+    global _bot_id
+    _bot_id = bot_id
 
 
 async def notify_owner(text: str, **kwargs):
@@ -137,14 +147,35 @@ async def start_listener():
     await asyncio.gather(*run_tasks)
 
 
+# Кеш названий чатов (B4: TTL 5 мин)
+_chat_names_cache: dict[int, str] = {}
+_chat_names_cache_time: float = 0
+_CHAT_NAMES_TTL = 300  # 5 минут
+
+
 async def resolve_chat_names(chat_ids: list[int]) -> dict[int, str]:
     """Получает названия чатов/групп через Telethon по их ID.
     Пробует все подключённые клиенты (группа может быть только в одном аккаунте).
-    Возвращает {chat_id: title}."""
+    Возвращает {chat_id: title}. Кеширует на 5 мин."""
+    global _chat_names_cache, _chat_names_cache_time
+    now = time.monotonic()
+
+    # Если кеш свежий — ищем сначала в нём
+    cache_valid = (now - _chat_names_cache_time) < _CHAT_NAMES_TTL
+
     result = {}
-    if not _clients:
-        return result
+    missing = []
     for cid in chat_ids:
+        if cache_valid and cid in _chat_names_cache:
+            result[cid] = _chat_names_cache[cid]
+        else:
+            missing.append(cid)
+
+    if not missing or not _clients:
+        return result
+
+    # Запрашиваем только недостающие
+    for cid in missing:
         for client in _clients:
             try:
                 entity = await client.get_entity(cid)
@@ -154,9 +185,12 @@ async def resolve_chat_names(chat_ids: list[int]) -> dict[int, str]:
                     last = getattr(entity, "last_name", "") or ""
                     title = f"{first} {last}".strip() or getattr(entity, "username", "") or str(cid)
                 result[cid] = title
-                break  # Нашли название — не пробуем остальные клиенты
+                _chat_names_cache[cid] = title
+                break
             except Exception:
-                continue  # Этот клиент не знает чат — пробуем следующий
+                continue
+
+    _chat_names_cache_time = now
     return result
 
 
@@ -250,8 +284,12 @@ async def on_new_message(event, account_label: str = ""):
 
         # --- AI-классификация для whitelist-чатов и личных чатов ---
 
-        # Проверка: новый контакт? (только для whitelist)
-        if in_whitelist and sender_id and sender_id != config.TELEGRAM_OWNER_ID:
+        # A2: НЕ классифицировать сообщения из чата с ботом —
+        # диалог owner↔bot обрабатывается через handle_free_text с tools
+        is_bot_chat = (is_private and (sender_id == _bot_id or chat_id == _bot_id))
+
+        # Проверка: новый контакт? (только для whitelist, не бот)
+        if in_whitelist and sender_id and sender_id != config.TELEGRAM_OWNER_ID and not is_bot_chat:
             is_known = await is_known_contact(sender_id)
             if not is_known:
                 contact = await get_or_create_contact(sender_id, sender_name)
@@ -262,12 +300,14 @@ async def on_new_message(event, account_label: str = ""):
                     f"Чат: {chat_title}",
                 )
 
-        # Классификация AI — для whitelist и личных чатов
-        if text and len(text) > 5:
+        # Классификация AI — для whitelist и личных чатов, НО НЕ для чата с ботом
+        if text and len(text) > 5 and not is_bot_chat:
             if _classify_callback:
+                # A9: mark_processed вызывается ПОСЛЕ классификации (в callback)
                 asyncio.create_task(
-                    _classify_callback(db_msg_id, text, sender_name, chat_title, chat_id)
+                    _classify_and_mark(db_msg_id, text, sender_name, chat_title, chat_id)
                 )
+                return  # mark_processed будет вызван в _classify_and_mark
 
         await mark_message_processed(db_msg_id)
 
@@ -326,22 +366,52 @@ def _get_media_type(msg) -> str | None:
     return None
 
 
+async def _classify_and_mark(db_msg_id, text, sender_name, chat_title, chat_id):
+    """Классифицирует сообщение, затем помечает как обработанное (A9)."""
+    try:
+        if _classify_callback:
+            await _classify_callback(db_msg_id, text, sender_name, chat_title, chat_id)
+    except Exception as e:
+        logger.error(f"Ошибка классификации #{db_msg_id}: {e}", exc_info=True)
+    finally:
+        await mark_message_processed(db_msg_id)
+
+
+# ─── Кеш whitelist/blacklist (B3: TTL 60 сек) ────────────────
+
+_wl_cache: set = set()
+_wl_cache_time: float = 0
+_bl_cache: set = set()
+_bl_cache_time: float = 0
+_CACHE_TTL = 60  # секунд
+
+
 async def _get_whitelist() -> set:
+    global _wl_cache, _wl_cache_time
+    now = time.monotonic()
+    if now - _wl_cache_time < _CACHE_TTL:
+        return _wl_cache
     raw = await get_setting("whitelist", "[]")
     try:
-        ids = json.loads(raw)
-        return set(ids)
+        _wl_cache = set(json.loads(raw))
     except json.JSONDecodeError:
-        return set()
+        _wl_cache = set()
+    _wl_cache_time = now
+    return _wl_cache
 
 
 async def _get_blacklist() -> set:
+    global _bl_cache, _bl_cache_time
+    now = time.monotonic()
+    if now - _bl_cache_time < _CACHE_TTL:
+        return _bl_cache
     raw = await get_setting("blacklist", "[]")
     try:
-        ids = json.loads(raw)
-        return set(ids)
+        _bl_cache = set(json.loads(raw))
     except json.JSONDecodeError:
-        return set()
+        _bl_cache = set()
+    _bl_cache_time = now
+    return _bl_cache
 
 
 async def _heartbeat_loop():

@@ -10,6 +10,8 @@ from src import config
 from src.db import (
     get_active_tasks, get_db_stats, get_setting, heartbeat,
     get_messages_since, get_dm_summary_data,
+    get_tasks_completed_since, get_tasks_created_since,
+    cleanup_conversation_history,
 )
 from src.ai_brain import brain
 from src.confidence_manager import send_batch_review
@@ -20,6 +22,10 @@ scheduler: AsyncIOScheduler = None
 
 # Callback для отправки в бот
 _notify_callback = None
+
+# A6: Трекинг отправленных уведомлений о дедлайнах
+_deadline_notified: dict[int, int] = {}  # task_id → количество уведомлений за сегодня
+_deadline_notified_date: date = None
 
 
 def set_notify_callback(callback):
@@ -104,13 +110,15 @@ async def evening_digest():
         tasks = await get_active_tasks()
         stats = await get_db_stats()
 
-        # Сообщения за последние 12 часов (с утра)
+        # A10: Реальные данные за последние 12 часов
         since = datetime.now(timezone.utc) - timedelta(hours=12)
+        completed_count = await get_tasks_completed_since(since)
+        new_count = await get_tasks_created_since(since)
 
         data = {
-            "completed": 0,
+            "completed": completed_count,
             "in_progress": len(tasks),
-            "new_tasks": 0,
+            "new_tasks": new_count,
             "messages_count": stats.get("messages", 0),
             "events": [],
         }
@@ -152,23 +160,35 @@ async def evening_digest():
 
 
 async def check_deadlines():
-    """Каждый час — проверка приближающихся дедлайнов."""
+    """Каждый час — проверка приближающихся дедлайнов.
+    A6: Дедупликация — max 1 раз "завтра", max 2 раза "сегодня"."""
+    global _deadline_notified, _deadline_notified_date
     try:
-        tasks = await get_active_tasks()
         today = date.today()
+        # Сброс счётчика при новом дне
+        if _deadline_notified_date != today:
+            _deadline_notified = {}
+            _deadline_notified_date = today
+
+        tasks = await get_active_tasks()
 
         for t in tasks:
             if not t.get("deadline"):
                 continue
+            task_id = t["id"]
             days_left = (t["deadline"].date() - today).days
-            if days_left == 0:
+            sent_count = _deadline_notified.get(task_id, 0)
+
+            if days_left == 0 and sent_count < 2:
                 await notify_owner(
-                    f"ДЕДЛАЙН СЕГОДНЯ: #{t['id']} {t['description']}"
+                    f"ДЕДЛАЙН СЕГОДНЯ: #{task_id} {t['description']}"
                 )
-            elif days_left == 1:
+                _deadline_notified[task_id] = sent_count + 1
+            elif days_left == 1 and sent_count < 1:
                 await notify_owner(
-                    f"Дедлайн ЗАВТРА: #{t['id']} {t['description']}"
+                    f"Дедлайн ЗАВТРА: #{task_id} {t['description']}"
                 )
+                _deadline_notified[task_id] = sent_count + 1
     except Exception as e:
         logger.error(f"Ошибка проверки дедлайнов: {e}", exc_info=True)
 
@@ -179,17 +199,41 @@ async def weekly_analysis():
         tasks = await get_active_tasks()
         stats = await get_db_stats()
 
+        # Статистика за неделю
+        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        completed_week = await get_tasks_completed_since(week_ago)
+        created_week = await get_tasks_created_since(week_ago)
+
+        # Топ отправителей за неделю
+        messages_week = await get_messages_since(week_ago, limit=1000)
+        sender_counts = {}
+        for m in messages_week:
+            name = m.get("sender_name", "?")
+            sender_counts[name] = sender_counts.get(name, 0) + 1
+        top_senders = sorted(sender_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_str = "\n".join(f"  {name}: {count} сообщ." for name, count in top_senders)
+
         text = (
             f"ЕЖЕНЕДЕЛЬНЫЙ АНАЛИЗ\n\n"
             f"Активных задач: {len(tasks)}\n"
+            f"Создано за неделю: {created_week}\n"
+            f"Закрыто за неделю: {completed_week}\n"
             f"Сообщений в БД: {stats.get('messages', 0)}\n"
             f"Размер БД: {stats.get('db_size', '?')}\n\n"
-            f"(Полный паттерн-анализ доступен с Фазы 4)"
+            f"Топ отправителей за неделю:\n{top_str}"
         )
         await notify_owner(text)
         logger.info("Еженедельный анализ отправлен")
     except Exception as e:
         logger.error(f"Ошибка еженедельного анализа: {e}", exc_info=True)
+
+
+async def cleanup_old_conversations():
+    """Каждый час — очистка старой истории диалога."""
+    try:
+        await cleanup_conversation_history(max_age_hours=4)
+    except Exception as e:
+        logger.error(f"Ошибка очистки conversation_history: {e}", exc_info=True)
 
 
 async def scheduler_heartbeat():
@@ -221,6 +265,9 @@ async def start_scheduler():
         hour=config.WEEKLY_ANALYSIS_HOUR,
         minute=0,
     ))
+
+    # Очистка старой истории диалога — каждый час
+    scheduler.add_job(cleanup_old_conversations, CronTrigger(minute=15))
 
     # Heartbeat — каждые 5 минут
     scheduler.add_job(scheduler_heartbeat, "interval", seconds=config.HEARTBEAT_INTERVAL_SEC)

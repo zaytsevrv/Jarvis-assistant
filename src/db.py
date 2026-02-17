@@ -27,6 +27,7 @@ async def init_pool() -> asyncpg.Pool:
         password=config.DB_PASSWORD,
         min_size=2,
         max_size=10,
+        command_timeout=15,
     )
     logger.info("PostgreSQL pool создан")
     return _pool
@@ -183,8 +184,8 @@ async def search_messages(query: str, limit: int = 20) -> list:
         # Fallback на ILIKE если слова слишком короткие
         return await _search_messages_ilike(query, limit)
 
-    # Объединяем слова через & (AND) для tsquery
-    tsquery = " & ".join(words)
+    # Безопасный полнотекстовый поиск через plainto_tsquery (A3: fix SQL injection)
+    search_query = " ".join(words)
 
     async with pool.acquire() as conn:
         # Проверяем наличие столбца tsv (миграция 002 могла не примениться)
@@ -197,12 +198,12 @@ async def search_messages(query: str, limit: int = 20) -> list:
 
         if has_tsv:
             rows = await conn.fetch(
-                """SELECT *, ts_rank(tsv, to_tsquery('russian', $1)) AS rank
+                """SELECT *, ts_rank(tsv, plainto_tsquery('russian', $1)) AS rank
                    FROM messages
-                   WHERE tsv @@ to_tsquery('russian', $1)
+                   WHERE tsv @@ plainto_tsquery('russian', $1)
                    ORDER BY rank DESC, timestamp DESC
                    LIMIT $2""",
-                tsquery, limit
+                search_query, limit
             )
         else:
             # Fallback если миграция FTS ещё не применена
@@ -674,3 +675,103 @@ async def get_db_stats() -> dict:
             "active_tasks": task_count,
             "db_size": db_size,
         }
+
+
+# ─── История диалога (conversation_history) ──────────────────
+
+async def save_conversation_message(
+    role: str,
+    content: str,
+    tool_calls: Optional[list] = None,
+    tool_results: Optional[list] = None,
+):
+    """Сохраняет сообщение диалога (user или assistant)."""
+    pool = await get_pool()
+    import json as _json
+    tc_json = _json.dumps(tool_calls) if tool_calls else None
+    tr_json = _json.dumps(tool_results) if tool_results else None
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO conversation_history (role, content, tool_calls, tool_results)
+               VALUES ($1, $2, $3::jsonb, $4::jsonb)""",
+            role, content, tc_json, tr_json,
+        )
+
+
+async def get_conversation_history(limit: int = 20) -> list[dict]:
+    """Загружает последние N сообщений диалога для передачи в messages[] API."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT role, content, tool_calls, tool_results, created_at
+               FROM conversation_history
+               ORDER BY created_at DESC
+               LIMIT $1""",
+            limit,
+        )
+    # Возвращаем в хронологическом порядке (от старых к новым)
+    result = []
+    for r in reversed(rows):
+        msg = {"role": r["role"], "content": r["content"]}
+        if r["tool_calls"]:
+            import json as _json
+            msg["tool_calls"] = _json.loads(r["tool_calls"]) if isinstance(r["tool_calls"], str) else r["tool_calls"]
+        result.append(msg)
+    return result
+
+
+async def cleanup_conversation_history(max_age_hours: int = 4):
+    """Удаляет сообщения диалога старше max_age_hours."""
+    pool = await get_pool()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    async with pool.acquire() as conn:
+        deleted = await conn.execute(
+            "DELETE FROM conversation_history WHERE created_at < $1", cutoff,
+        )
+        if deleted and deleted != "DELETE 0":
+            logger.info(f"Очистка истории диалога: {deleted}")
+
+
+# ─── Задачи: статистика за период ────────────────────────────
+
+async def get_tasks_completed_since(since: datetime) -> int:
+    """Количество задач, выполненных с указанного момента."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND completed_at >= $1",
+            since,
+        )
+
+
+async def get_tasks_created_since(since: datetime) -> int:
+    """Количество задач, созданных с указанного момента."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE created_at >= $1",
+            since,
+        )
+
+
+# ─── Обновление задачи ──────────────────────────────────────
+
+async def update_task(task_id: int, **kwargs):
+    """Обновление полей задачи. kwargs: description, deadline, who."""
+    pool = await get_pool()
+    updates = []
+    values = [task_id]
+    idx = 2
+    for key in ("description", "deadline", "who"):
+        if key in kwargs:
+            updates.append(f"{key} = ${idx}")
+            values.append(kwargs[key])
+            idx += 1
+    if not updates:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE tasks SET {', '.join(updates)} WHERE id = $1",
+            *values,
+        )

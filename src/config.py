@@ -78,6 +78,9 @@ LOGS_DIR = BASE_DIR / "logs"
 USER_TIMEZONE_OFFSET = 7            # UTC+7
 USER_TIMEZONE_NAME = "Красноярск"
 
+# === Диалог ===
+CONVERSATION_WINDOW_SIZE = _get_int("CONVERSATION_WINDOW_SIZE", 20)
+
 # === Константы ===
 HEARTBEAT_INTERVAL_SEC = 300        # 5 минут
 CONFIDENCE_HIGH = 80                # >80% — молча создаёт
@@ -88,3 +91,28 @@ BRIEFING_HOUR = 2                   # 02:00 UTC = 09:00 Красноярск
 DIGEST_HOUR = 14                    # 14:00 UTC = 21:00 Красноярск
 WEEKLY_ANALYSIS_DAY = "sun"         # Воскресенье
 WEEKLY_ANALYSIS_HOUR = 3            # 03:00 UTC = 10:00 Красноярск
+
+
+def validate_config():
+    """Проверяет обязательные переменные окружения при старте. Fail fast."""
+    errors = []
+
+    if not TELEGRAM_BOT_TOKEN:
+        errors.append("TELEGRAM_BOT_TOKEN не задан")
+    if not TELEGRAM_OWNER_ID:
+        errors.append("TELEGRAM_OWNER_ID не задан")
+    if not TELEGRAM_API_ID:
+        errors.append("TELEGRAM_API_ID не задан")
+    if not TELEGRAM_API_HASH:
+        errors.append("TELEGRAM_API_HASH не задан")
+    if not DB_PASSWORD:
+        errors.append("DB_PASSWORD не задан")
+
+    # API mode требует ключ
+    if AI_MODE_DEFAULT == "api" and not ANTHROPIC_API_KEY:
+        errors.append("AI_MODE=api, но ANTHROPIC_API_KEY не задан")
+
+    if errors:
+        raise RuntimeError(
+            "Ошибки конфигурации (.env):\n" + "\n".join(f"  - {e}" for e in errors)
+        )

@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import functools
+import html as html_lib
 import io
 import json
 import logging
@@ -7,6 +9,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -26,6 +29,8 @@ from src.db import (
     get_known_chats,
     get_module_health,
     get_setting,
+    save_conversation_message,
+    get_conversation_history,
     search_messages,
     set_setting,
     complete_task,
@@ -56,6 +61,7 @@ def _now_local() -> datetime:
 
 def owner_only(handler):
     """Декоратор: только владелец может использовать."""
+    @functools.wraps(handler)
     async def wrapper(message: Message, **kwargs):
         if message.from_user.id != config.TELEGRAM_OWNER_ID:
             return
@@ -77,17 +83,49 @@ async def _mode_footer() -> str:
         return f"\n\n— API mode (${cost:.3f}) | {ok_count}/{total} модулей OK"
 
 
-async def send_to_owner(text: str, reply_markup=None):
-    """Отправка сообщения владельцу."""
-    # Telegram лимит 4096 символов
-    if len(text) > 4096:
-        text = text[:4090] + "..."
-    await bot.send_message(
-        config.TELEGRAM_OWNER_ID,
-        text,
-        reply_markup=reply_markup,
-        parse_mode=None,
-    )
+def _split_message(text: str, max_len: int = 4096) -> list[str]:
+    """Разбивает длинное сообщение на части по \\n перед лимитом."""
+    if len(text) <= max_len:
+        return [text]
+
+    parts = []
+    while text:
+        if len(text) <= max_len:
+            parts.append(text)
+            break
+        # Ищем последний \n перед лимитом
+        split_pos = text.rfind("\n", 0, max_len)
+        if split_pos <= 0:
+            # Нет \n — режем по пробелу
+            split_pos = text.rfind(" ", 0, max_len)
+        if split_pos <= 0:
+            # Совсем нет — режем жёстко
+            split_pos = max_len
+        parts.append(text[:split_pos])
+        text = text[split_pos:].lstrip("\n")
+    return parts
+
+
+async def send_to_owner(text: str, reply_markup=None, parse_mode: str = "HTML"):
+    """Отправка сообщения владельцу. Поддержка длинных сообщений и HTML."""
+    parts = _split_message(text, max_len=4096)
+    for i, part in enumerate(parts):
+        markup = reply_markup if i == len(parts) - 1 else None
+        try:
+            await bot.send_message(
+                config.TELEGRAM_OWNER_ID,
+                part,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+            )
+        except Exception:
+            # Если HTML-парсинг упал — отправляем без parse_mode
+            await bot.send_message(
+                config.TELEGRAM_OWNER_ID,
+                part,
+                reply_markup=markup,
+                parse_mode=None,
+            )
 
 
 # Callback для уведомлений из других модулей
@@ -373,6 +411,34 @@ async def cb_batch_none(callback: CallbackQuery):
     await callback.answer("Все отклонены")
 
 
+@router.callback_query(F.data.startswith("batch_pick:"))
+async def cb_batch_pick(callback: CallbackQuery):
+    """A5: Кнопка 'Выбрать' — показываем каждый элемент с индивидуальными кнопками."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    ids = [int(x) for x in callback.data.split(":")[1].split(",") if x]
+    from src.db import get_pool
+    pool = await get_pool()
+    buttons = []
+    for qid in ids:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT sender_name, text_preview FROM confidence_queue WHERE id = $1 AND resolved = FALSE",
+                qid,
+            )
+        if row:
+            short = (row["text_preview"] or "")[:40]
+            buttons.append([
+                InlineKeyboardButton(text=f"Задача: {short}", callback_data=f"conf_yes:{qid}"),
+                InlineKeyboardButton(text="Нет", callback_data=f"conf_no:{qid}"),
+            ])
+    if buttons:
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.edit_text("Выбери по каждому:", reply_markup=markup)
+    else:
+        await callback.answer("Нет неразрешённых вопросов")
+
+
 @router.callback_query(F.data.startswith("admin:"))
 async def cb_admin(callback: CallbackQuery):
     if callback.from_user.id != config.TELEGRAM_OWNER_ID:
@@ -380,10 +446,7 @@ async def cb_admin(callback: CallbackQuery):
     action = callback.data.split(":")[1]
 
     if action == "restart":
-        modules = [
-            "telegram_listener", "telegram_bot", "ai_brain",
-            "email_checker", "whisper_processor", "scheduler", "watchdog",
-        ]
+        modules = ["jarvis"]  # Один сервис systemd, а не отдельные модули
         buttons = [
             [InlineKeyboardButton(text=m, callback_data=f"restart_mod:{m}")]
             for m in modules
@@ -975,7 +1038,7 @@ async def btn_query(message: Message):
 @owner_only
 async def handle_photo(message: Message):
     """Обработка фото — Claude Vision."""
-    await message.answer("Анализирую изображение...")
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     # Скачиваем фото (максимальное разрешение)
     photo = message.photo[-1]
@@ -986,7 +1049,7 @@ async def handle_photo(message: Message):
 
     question = message.caption.strip() if message.caption else "Опиши и проанализируй что на этом изображении. Если это счёт, штраф, документ — выдели ключевые данные (суммы, даты, реквизиты)."
 
-    system_context = await _build_system_context()
+    system_context = await _build_dynamic_context()
     context = await build_context(question) if message.caption else ""
 
     try:
@@ -997,15 +1060,17 @@ async def handle_photo(message: Message):
             context=context,
             system_context=system_context,
         )
-        await send_to_owner(answer)
+        footer = await _mode_footer()
+        await send_to_owner(html_lib.escape(answer) + footer)
     except Exception as e:
         logger.error(f"Vision error: {e}", exc_info=True)
-        await send_to_owner(f"Не удалось проанализировать изображение: {e}")
+        await send_to_owner(f"Не удалось проанализировать изображение: {html_lib.escape(str(e))}")
 
 
 @router.message(F.text)
 @owner_only
 async def handle_free_text(message: Message):
+    """Основной обработчик свободного текста — диалог с tool_use."""
     text = message.text.strip()
 
     # Текстовые команды переключения режима
@@ -1020,56 +1085,83 @@ async def handle_free_text(message: Message):
         await send_to_owner("Переключено на Claude CLI (подписка).\nДля возврата: /mode или напиши \"переключи на API\"")
         return
 
-    # Свободный запрос к AI
-    await message.answer("Ищу...")
+    # Typing indicator вместо "Ищу..." (A1)
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    context = await build_context(text)
-    system_context = await _build_system_context()
+    try:
+        # 1. Сохраняем сообщение пользователя в историю
+        await save_conversation_message(role="user", content=text)
 
-    answer = await brain.answer_query(text, context, system_context=system_context)
-    await send_to_owner(answer)
+        # 2. Загружаем историю диалога (окно N сообщений)
+        history = await get_conversation_history(limit=config.CONVERSATION_WINDOW_SIZE)
+
+        # 3. Формируем messages[] для API
+        api_messages = []
+        for msg in history:
+            api_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        # 4. Собираем динамический контекст
+        dynamic_context = await _build_dynamic_context()
+
+        # 5. Вызываем модель с tools
+        result = await brain.ask_with_tools(
+            messages=api_messages,
+            dynamic_context=dynamic_context,
+        )
+
+        answer_text = result["text"]
+
+        # 6. Сохраняем ответ ассистента в историю
+        await save_conversation_message(
+            role="assistant",
+            content=answer_text,
+            tool_calls=result.get("tool_calls"),
+        )
+
+        # 7. Отправляем ответ с футером
+        footer = await _mode_footer()
+        await send_to_owner(answer_text + footer)
+
+    except Exception as e:
+        logger.error(f"handle_free_text error: {e}", exc_info=True)
+        await send_to_owner(f"Ошибка: {html_lib.escape(str(e))}")
 
 
-async def _build_system_context() -> str:
-    """Собирает динамический контекст для system prompt AI."""
+async def _build_dynamic_context() -> str:
+    """Собирает динамический контекст для system prompt AI.
+    Включается в каждый запрос (не кешируется)."""
     parts = []
 
-    # Whitelist с названиями
+    # Аккаунты
+    if config.TELEGRAM_API_ID_2:
+        parts.append(f"Мониторю 2 Telegram-аккаунта: [{config.ACCOUNT_LABEL_1}] и [{config.ACCOUNT_LABEL_2}].")
+    else:
+        parts.append(f"Мониторю 1 Telegram-аккаунт: [{config.ACCOUNT_LABEL_1}].")
+
+    # Whitelist
     raw_wl = await get_setting("whitelist", "[]")
     try:
         wl_ids = json.loads(raw_wl)
     except json.JSONDecodeError:
         wl_ids = []
 
-    # Аккаунты
-    if config.TELEGRAM_API_ID_2:
-        parts.append(f"Мониторю 2 Telegram-аккаунта: [{config.ACCOUNT_LABEL_1}] и [{config.ACCOUNT_LABEL_2}]. В сводках каждое сообщение помечено аккаунтом.")
-    else:
-        parts.append(f"Мониторю 1 Telegram-аккаунт: [{config.ACCOUNT_LABEL_1}].")
-
     if wl_ids:
         chat_names = await resolve_chat_names(wl_ids)
         wl_names = [chat_names.get(cid, str(cid)) for cid in wl_ids]
-        parts.append(f"Мониторинг: {len(wl_ids)} групп в whitelist ({', '.join(wl_names)}) + все личные чаты (кроме ботов).")
+        parts.append(f"Whitelist ({len(wl_ids)} групп): {', '.join(wl_names)}.")
     else:
-        parts.append("Мониторинг: whitelist пуст, только личные чаты (кроме ботов).")
+        parts.append("Whitelist пуст.")
 
     # Статистика
     stats = await get_db_stats()
     parts.append(f"В памяти: {stats.get('messages', 0)} сообщений, {stats.get('active_tasks', 0)} активных задач.")
 
-    # Свежие ЛС
+    # Свежие ЛС (краткая сводка)
     since = datetime.now(timezone.utc) - timedelta(hours=12)
     dm_data = await get_dm_summary_data(since)
     if dm_data:
-        dm_lines = []
-        for d in dm_data[:10]:
-            acc = d.get("account", "")
-            acc_tag = f" [{acc}]" if acc else ""
-            dm_lines.append(f"{d['sender_name']}{acc_tag} ({d['msg_count']} сообщ.)")
-        parts.append(f"Свежие ЛС за 12ч: {', '.join(dm_lines)}.")
-
-    parts.append("Ты имеешь полный доступ к базе данных сообщений. Если знаешь ответ из контекста — отвечай уверенно.")
+        dm_names = [f"{d['sender_name']} ({d['msg_count']})" for d in dm_data[:8]]
+        parts.append(f"Свежие ЛС за 12ч: {', '.join(dm_names)}.")
 
     return "\n".join(parts)
 

@@ -15,6 +15,7 @@ from src.telegram_listener import (
     stop_listener,
     set_notify_callback as listener_set_notify,
     set_classify_callback,
+    set_bot_id,
 )
 from src.confidence_manager import (
     process_classification,
@@ -62,6 +63,10 @@ async def main():
     logger.info("JARVIS запускается...")
     logger.info("=" * 50)
 
+    # 0. Валидация конфигурации (fail fast)
+    config.validate_config()
+    logger.info("Конфигурация OK")
+
     # 1. База данных
     logger.info("Инициализация PostgreSQL...")
     await init_pool()
@@ -71,6 +76,12 @@ async def main():
     # 2. Привязка callbacks (все модули уведомляют через бот)
     listener_set_notify(notify_callback)
     set_classify_callback(process_classification)
+    # A2: Передаём bot_id чтобы listener не классифицировал диалог с ботом
+    try:
+        bot_id = int(config.TELEGRAM_BOT_TOKEN.split(":")[0])
+        set_bot_id(bot_id)
+    except (ValueError, IndexError):
+        logger.warning("Не удалось извлечь bot_id из TELEGRAM_BOT_TOKEN")
     confidence_set_notify(notify_callback)
     scheduler_set_notify(notify_callback)
     watchdog_set_notify(notify_callback)
@@ -94,7 +105,14 @@ async def main():
         logger.info("Получен сигнал остановки")
 
 
+_shutting_down = False
+
+
 async def shutdown():
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
     logger.info("Останавливаю JARVIS...")
     await stop_scheduler()
     await stop_listener()
