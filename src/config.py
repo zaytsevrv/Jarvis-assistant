@@ -22,6 +22,15 @@ TELEGRAM_PHONE = _get("TELEGRAM_PHONE")
 TELEGRAM_BOT_TOKEN = _get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_OWNER_ID = _get_int("TELEGRAM_OWNER_ID")
 
+# === Telegram: второй аккаунт ===
+TELEGRAM_API_ID_2 = _get_int("TELEGRAM_API_ID_2", 0)
+TELEGRAM_API_HASH_2 = _get("TELEGRAM_API_HASH_2", "")
+TELEGRAM_PHONE_2 = _get("TELEGRAM_PHONE_2", "")
+
+# === Метки аккаунтов (для отображения в сводках) ===
+ACCOUNT_LABEL_1 = _get("ACCOUNT_LABEL_1", "основной")  # акк с ботом
+ACCOUNT_LABEL_2 = _get("ACCOUNT_LABEL_2", "9514")       # второй акк
+
 # === PostgreSQL ===
 DB_HOST = _get("DB_HOST", "localhost")
 DB_PORT = _get_int("DB_PORT", 5432)

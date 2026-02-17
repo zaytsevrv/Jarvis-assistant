@@ -26,8 +26,8 @@ from src.ai_brain import brain
 
 logger = logging.getLogger("jarvis.listener")
 
-# Telegram-клиент (Telethon)
-client: TelegramClient = None
+# Список Telegram-клиентов (Telethon) — один или два аккаунта
+_clients: list[TelegramClient] = []
 
 # Callback для уведомлений в бот (устанавливается из main.py)
 _notify_callback = None
@@ -78,37 +78,98 @@ def _build_proxy():
         return None
 
 
+def _make_handler(account_label: str):
+    """Создаёт обработчик сообщений с привязкой к конкретному аккаунту."""
+    async def handler(event):
+        await on_new_message(event, account_label)
+    return handler
+
+
 async def start_listener():
-    global client
+    """Запускает Telethon-клиенты для всех настроенных аккаунтов."""
+    global _clients
+    _clients = []
 
     proxy = _build_proxy()
 
-    client = TelegramClient(
-        "jarvis_session",
-        config.TELEGRAM_API_ID,
-        config.TELEGRAM_API_HASH,
-        proxy=proxy,
-    )
-    await client.start(phone=config.TELEGRAM_PHONE)
-    proxy_label = f" через proxy ({config.PROXY_TYPE})" if proxy else ""
-    logger.info(f"Telethon: подключён{proxy_label}")
+    # Список аккаунтов для подключения
+    accounts = [
+        {
+            "session": "jarvis_session",
+            "api_id": config.TELEGRAM_API_ID,
+            "api_hash": config.TELEGRAM_API_HASH,
+            "phone": config.TELEGRAM_PHONE,
+            "label": config.ACCOUNT_LABEL_1,
+        },
+    ]
 
-    # Регистрация обработчика
-    client.add_event_handler(on_new_message, events.NewMessage)
+    # Второй аккаунт — если настроен
+    if config.TELEGRAM_API_ID_2 and config.TELEGRAM_PHONE_2:
+        accounts.append({
+            "session": "jarvis_session_2",
+            "api_id": config.TELEGRAM_API_ID_2,
+            "api_hash": config.TELEGRAM_API_HASH_2,
+            "phone": config.TELEGRAM_PHONE_2,
+            "label": config.ACCOUNT_LABEL_2,
+        })
+
+    run_tasks = []
+    for acc in accounts:
+        client = TelegramClient(
+            acc["session"],
+            acc["api_id"],
+            acc["api_hash"],
+            proxy=proxy,
+        )
+        await client.start(phone=acc["phone"])
+        client.add_event_handler(
+            _make_handler(acc["label"]),
+            events.NewMessage,
+        )
+        _clients.append(client)
+        logger.info(f"Telethon: аккаунт [{acc['label']}] подключён")
+        run_tasks.append(client.run_until_disconnected())
 
     # Heartbeat
     asyncio.create_task(_heartbeat_loop())
 
-    # Держим клиент запущенным
-    await client.run_until_disconnected()
+    # Держим все клиенты запущенными
+    await asyncio.gather(*run_tasks)
+
+
+async def resolve_chat_names(chat_ids: list[int]) -> dict[int, str]:
+    """Получает названия чатов/групп через Telethon по их ID.
+    Пробует все подключённые клиенты (группа может быть только в одном аккаунте).
+    Возвращает {chat_id: title}."""
+    result = {}
+    if not _clients:
+        return result
+    for cid in chat_ids:
+        for client in _clients:
+            try:
+                entity = await client.get_entity(cid)
+                title = getattr(entity, "title", None)
+                if not title:
+                    first = getattr(entity, "first_name", "") or ""
+                    last = getattr(entity, "last_name", "") or ""
+                    title = f"{first} {last}".strip() or getattr(entity, "username", "") or str(cid)
+                result[cid] = title
+                break  # Нашли название — не пробуем остальные клиенты
+            except Exception:
+                continue  # Этот клиент не знает чат — пробуем следующий
+    return result
 
 
 async def stop_listener():
-    global client
-    if client:
-        await client.disconnect()
-        client = None
-        logger.info("Telethon: отключён")
+    global _clients
+    for client in _clients:
+        try:
+            await client.disconnect()
+        except Exception as e:
+            logger.error(f"Ошибка отключения клиента: {e}")
+    count = len(_clients)
+    _clients = []
+    logger.info(f"Telethon: отключено {count} аккаунт(ов)")
 
 
 # ─── Обработка сообщений ─────────────────────────────────────
@@ -118,7 +179,7 @@ def _is_private_chat(msg) -> bool:
     return isinstance(msg.peer_id, PeerUser)
 
 
-async def on_new_message(event):
+async def on_new_message(event, account_label: str = ""):
     try:
         msg = event.message
 
@@ -181,6 +242,7 @@ async def on_new_message(event):
             text=text,
             media_type=media_type,
             timestamp=msg.date or datetime.now(timezone.utc),
+            account=account_label,
         )
 
         if db_msg_id is None:

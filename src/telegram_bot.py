@@ -32,6 +32,7 @@ from src.db import (
     cancel_task,
 )
 from src.ai_brain import brain
+from src.telegram_listener import resolve_chat_names
 from src.confidence_manager import (
     resolve_batch_all_tasks,
     resolve_batch_nothing,
@@ -242,6 +243,12 @@ async def cmd_health(message: Message):
     mode = await brain.get_mode()
     lines.append(f"\nБД: PostgreSQL OK, {stats.get('db_size', '?')}")
     lines.append(f"AI mode: {'CLI (подписка)' if mode == 'cli' else 'API (токены)'}")
+
+    # Аккаунты
+    acc_info = f"Аккаунты: [{config.ACCOUNT_LABEL_1}]"
+    if config.TELEGRAM_API_ID_2:
+        acc_info += f" + [{config.ACCOUNT_LABEL_2}]"
+    lines.append(acc_info)
 
     await send_to_owner("\n".join(lines))
 
@@ -456,11 +463,11 @@ async def cmd_whitelist(message: Message):
     if len(args) < 2:
         lines = []
         if wl:
-            known = await get_known_chats(exclude_private=True)
-            chat_map = {c["chat_id"]: c["chat_title"] for c in known}
+            # Получаем названия напрямую из Telegram через Telethon
+            chat_names = await resolve_chat_names(wl)
             lines.append(f"Whitelist ({len(wl)} чатов):")
             for cid in wl:
-                name = chat_map.get(cid, "")
+                name = chat_names.get(cid, "")
                 label = f"{cid} ({name})" if name else str(cid)
                 lines.append(f"  • {label}")
         else:
@@ -539,16 +546,20 @@ async def cb_wl_manage(callback: CallbackQuery):
     except json.JSONDecodeError:
         wl = []
 
+    # Собираем все известные chat_id: из БД + из whitelist
     known = await get_known_chats(exclude_private=True)
-    if not known:
-        await callback.answer("Пока нет известных групп в БД")
+    all_ids = list({c["chat_id"] for c in known} | set(wl))
+    if not all_ids:
+        await callback.answer("Пока нет известных групп")
         return
+
+    # Получаем актуальные названия через Telethon
+    chat_names = await resolve_chat_names(all_ids)
 
     buttons = []
     row = []
-    for chat in known[:10]:
-        cid = chat["chat_id"]
-        title = chat["chat_title"] or str(cid)
+    for cid in all_ids[:10]:
+        title = chat_names.get(cid, str(cid))
         short = title[:18] if len(title) <= 18 else title[:16] + ".."
         if cid in wl:
             row.append(InlineKeyboardButton(text=f"❌ {short}", callback_data=f"wl_del:{cid}"))
@@ -639,11 +650,13 @@ async def cb_wl_close(callback: CallbackQuery):
 async def _refresh_wl_manage(message, wl: list):
     """Перерисовать кнопки управления whitelist."""
     known = await get_known_chats(exclude_private=True)
+    all_ids = list({c["chat_id"] for c in known} | set(wl))
+    chat_names = await resolve_chat_names(all_ids)
+
     buttons = []
     row = []
-    for chat in known[:10]:
-        cid = chat["chat_id"]
-        title = chat["chat_title"] or str(cid)
+    for cid in all_ids[:10]:
+        title = chat_names.get(cid, str(cid))
         short = title[:18] if len(title) <= 18 else title[:16] + ".."
         if cid in wl:
             row.append(InlineKeyboardButton(text=f"❌ {short}", callback_data=f"wl_del:{cid}"))
@@ -743,11 +756,10 @@ async def cmd_blacklist(message: Message):
     if len(args) < 2:
         lines = []
         if bl:
-            known = await get_known_chats(exclude_private=False)
-            chat_map = {c["chat_id"]: c["chat_title"] for c in known}
+            chat_names = await resolve_chat_names(bl)
             lines.append(f"Blacklist ({len(bl)} записей):")
             for cid in bl:
-                name = chat_map.get(cid, "")
+                name = chat_names.get(cid, "")
                 label = f"{cid} ({name})" if name else str(cid)
                 lines.append(f"  • {label}")
         else:
@@ -818,17 +830,19 @@ async def cb_bl_manage(callback: CallbackQuery):
     except json.JSONDecodeError:
         bl = []
 
-    # Показываем все известные чаты (включая ЛС)
+    # Собираем все известные chat_id из БД + blacklist
     known = await get_known_chats(exclude_private=False)
-    if not known:
-        await callback.answer("Пока нет известных чатов в БД")
+    all_ids = list({c["chat_id"] for c in known} | set(bl))
+    if not all_ids:
+        await callback.answer("Пока нет известных чатов")
         return
+
+    chat_names = await resolve_chat_names(all_ids)
 
     buttons = []
     row = []
-    for chat in known[:12]:
-        cid = chat["chat_id"]
-        title = chat["chat_title"] or str(cid)
+    for cid in all_ids[:12]:
+        title = chat_names.get(cid, str(cid))
         short = title[:18] if len(title) <= 18 else title[:16] + ".."
         if cid in bl:
             row.append(InlineKeyboardButton(text=f"✅ {short}", callback_data=f"bl_del:{cid}"))
@@ -917,11 +931,13 @@ async def cb_bl_close(callback: CallbackQuery):
 async def _refresh_bl_manage(message, bl: list):
     """Перерисовать кнопки управления blacklist."""
     known = await get_known_chats(exclude_private=False)
+    all_ids = list({c["chat_id"] for c in known} | set(bl))
+    chat_names = await resolve_chat_names(all_ids)
+
     buttons = []
     row = []
-    for chat in known[:12]:
-        cid = chat["chat_id"]
-        title = chat["chat_title"] or str(cid)
+    for cid in all_ids[:12]:
+        title = chat_names.get(cid, str(cid))
         short = title[:18] if len(title) <= 18 else title[:16] + ".."
         if cid in bl:
             row.append(InlineKeyboardButton(text=f"✅ {short}", callback_data=f"bl_del:{cid}"))
@@ -1025,10 +1041,15 @@ async def _build_system_context() -> str:
     except json.JSONDecodeError:
         wl_ids = []
 
+    # Аккаунты
+    if config.TELEGRAM_API_ID_2:
+        parts.append(f"Мониторю 2 Telegram-аккаунта: [{config.ACCOUNT_LABEL_1}] и [{config.ACCOUNT_LABEL_2}]. В сводках каждое сообщение помечено аккаунтом.")
+    else:
+        parts.append(f"Мониторю 1 Telegram-аккаунт: [{config.ACCOUNT_LABEL_1}].")
+
     if wl_ids:
-        known = await get_known_chats(exclude_private=True)
-        chat_map = {c["chat_id"]: c["chat_title"] for c in known}
-        wl_names = [chat_map.get(cid, str(cid)) for cid in wl_ids]
+        chat_names = await resolve_chat_names(wl_ids)
+        wl_names = [chat_names.get(cid, str(cid)) for cid in wl_ids]
         parts.append(f"Мониторинг: {len(wl_ids)} групп в whitelist ({', '.join(wl_names)}) + все личные чаты (кроме ботов).")
     else:
         parts.append("Мониторинг: whitelist пуст, только личные чаты (кроме ботов).")
@@ -1041,7 +1062,11 @@ async def _build_system_context() -> str:
     since = datetime.now(timezone.utc) - timedelta(hours=12)
     dm_data = await get_dm_summary_data(since)
     if dm_data:
-        dm_lines = [f"{d['sender_name']} ({d['msg_count']} сообщ.)" for d in dm_data[:10]]
+        dm_lines = []
+        for d in dm_data[:10]:
+            acc = d.get("account", "")
+            acc_tag = f" [{acc}]" if acc else ""
+            dm_lines.append(f"{d['sender_name']}{acc_tag} ({d['msg_count']} сообщ.)")
         parts.append(f"Свежие ЛС за 12ч: {', '.join(dm_lines)}.")
 
     parts.append("Ты имеешь полный доступ к базе данных сообщений. Если знаешь ответ из контекста — отвечай уверенно.")

@@ -136,6 +136,7 @@ async def save_message(
     text: str,
     media_type: Optional[str],
     timestamp: datetime,
+    account: str = "",
 ) -> Optional[int]:
     """Сохраняет сообщение. Возвращает id или None при дубликате."""
     pool = await get_pool()
@@ -143,12 +144,12 @@ async def save_message(
         row = await conn.fetchrow(
             """INSERT INTO messages
                (telegram_msg_id, chat_id, chat_title, sender_id, sender_name,
-                text, media_type, timestamp)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-               ON CONFLICT (telegram_msg_id, chat_id) DO NOTHING
+                text, media_type, timestamp, account)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (telegram_msg_id, chat_id, account) DO NOTHING
                RETURNING id""",
             telegram_msg_id, chat_id, chat_title, sender_id, sender_name,
-            text, media_type, timestamp,
+            text, media_type, timestamp, account,
         )
         return row["id"] if row else None
 
@@ -244,7 +245,7 @@ async def get_messages_since(since: datetime, chat_ids: list = None, limit: int 
     async with pool.acquire() as conn:
         if chat_ids:
             rows = await conn.fetch(
-                """SELECT chat_id, chat_title, sender_name, text, timestamp
+                """SELECT chat_id, chat_title, sender_name, text, timestamp, account
                    FROM messages
                    WHERE timestamp >= $1 AND chat_id = ANY($2::bigint[])
                    ORDER BY chat_id, timestamp
@@ -253,7 +254,7 @@ async def get_messages_since(since: datetime, chat_ids: list = None, limit: int 
             )
         else:
             rows = await conn.fetch(
-                """SELECT chat_id, chat_title, sender_name, text, timestamp
+                """SELECT chat_id, chat_title, sender_name, text, timestamp, account
                    FROM messages
                    WHERE timestamp >= $1
                    ORDER BY timestamp DESC
@@ -276,27 +277,27 @@ async def get_dm_summary_data(since: datetime, limit: int = 100) -> list:
     async with pool.acquire() as conn:
         if bl_ids:
             rows = await conn.fetch(
-                """SELECT sender_name, COUNT(*) as msg_count,
+                """SELECT sender_name, account, COUNT(*) as msg_count,
                           STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
                    FROM messages
                    WHERE timestamp >= $1
                      AND sender_id != $2
                      AND sender_id != ALL($3::bigint[])
                      AND chat_id = sender_id
-                   GROUP BY sender_name
+                   GROUP BY sender_name, account
                    ORDER BY msg_count DESC
                    LIMIT $4""",
                 since, config.TELEGRAM_OWNER_ID, bl_ids, limit,
             )
         else:
             rows = await conn.fetch(
-                """SELECT sender_name, COUNT(*) as msg_count,
+                """SELECT sender_name, account, COUNT(*) as msg_count,
                           STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
                    FROM messages
                    WHERE timestamp >= $1
                      AND sender_id != $2
                      AND chat_id = sender_id
-                   GROUP BY sender_name
+                   GROUP BY sender_name, account
                    ORDER BY msg_count DESC
                    LIMIT $3""",
                 since, config.TELEGRAM_OWNER_ID, limit,
@@ -360,7 +361,9 @@ def _format_messages(messages: list, header: str = "") -> str:
         ts_str = ts.strftime("%d.%m %H:%M") if ts else "?"
         sender = m.get("sender_name", "?")
         chat = m.get("chat_title", "")
-        lines.append(f"[{ts_str}] {sender} ({chat}): {text}")
+        acc = m.get("account", "")
+        acc_tag = f" [{acc}]" if acc else ""
+        lines.append(f"[{ts_str}] {sender}{acc_tag} ({chat}): {text}")
     return "\n".join(lines)
 
 
@@ -383,7 +386,9 @@ async def build_context(query: str, max_chars: int = 50000) -> str:
     if dm_data:
         dm_lines = ["СВЕЖИЕ ЛС (за 12ч):"]
         for d in dm_data[:15]:
-            dm_lines.append(f"  {d['sender_name']} ({d['msg_count']} сообщ.): {d['previews'][:200]}")
+            acc = d.get("account", "")
+            acc_tag = f" [{acc}]" if acc else ""
+            dm_lines.append(f"  {d['sender_name']}{acc_tag} ({d['msg_count']} сообщ.): {d['previews'][:200]}")
         dm_text = "\n".join(dm_lines)
         parts.append(dm_text)
         used_chars += len(dm_text)
