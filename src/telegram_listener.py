@@ -38,6 +38,9 @@ _classify_callback = None
 # ID бота — определяется при старте, используется для фильтрации
 _bot_id: int = 0
 
+# Флаг: Telethon восстанавливается после падения
+_recovering: bool = False
+
 
 def set_notify_callback(callback):
     global _notify_callback
@@ -53,6 +56,12 @@ def set_bot_id(bot_id: int):
     """Устанавливает ID бота для фильтрации classify pipeline."""
     global _bot_id
     _bot_id = bot_id
+
+
+def set_recovery_flag():
+    """Ставит флаг: при следующем успешном подключении — уведомить владельца."""
+    global _recovering
+    _recovering = True
 
 
 async def notify_owner(text: str, **kwargs):
@@ -138,6 +147,12 @@ async def start_listener():
         )
         _clients.append(client)
         logger.info(f"Telethon: аккаунт [{acc['label']}] подключён")
+
+    # Уведомление о восстановлении после падения
+    global _recovering
+    if _recovering:
+        _recovering = False
+        await notify_owner("✅ <b>Telethon восстановлен</b>\nМониторинг чатов снова работает.")
 
     # Heartbeat
     asyncio.create_task(_heartbeat_loop())

@@ -106,25 +106,33 @@ async def main():
 
 
 async def _resilient_listener():
-    """Wrapper: перезапускает Telethon при крашах, не убивая бот и scheduler."""
+    """Wrapper: перезапускает Telethon при крашах, не убивая бот и scheduler.
+    Уведомления: одно при падении, одно при восстановлении. Без спама."""
     retry_delay = 30
     max_delay = 300  # 5 мин максимум
+    notified_down = False
 
     while not _shutting_down:
         try:
+            # Если это retry после падения — ставим флаг для уведомления
+            from src.telegram_listener import set_recovery_flag
+            if notified_down:
+                set_recovery_flag()
             await start_listener()
             break  # Нормальное завершение (shutdown)
         except Exception as e:
             logger.error(f"Telethon crashed: {e}")
-            # Уведомляем владельца
-            try:
-                await notify_callback(
-                    f"⚠️ <b>Telethon упал</b>: {str(e)[:100]}\n"
-                    "Мониторинг чатов не работает. Бот отвечает, но не видит сообщения.\n"
-                    f"Автоперезапуск через {retry_delay} сек."
-                )
-            except Exception:
-                pass
+            # Одно уведомление при первом падении
+            if not notified_down:
+                notified_down = True
+                try:
+                    await notify_callback(
+                        "⚠️ <b>Telethon отключён</b>\n"
+                        "Мониторинг чатов не работает. Бот отвечает, но не видит новые сообщения.\n"
+                        "Буду пробовать переподключиться автоматически."
+                    )
+                except Exception:
+                    pass
             # Чистим клиенты
             try:
                 await stop_listener()
@@ -134,11 +142,6 @@ async def _resilient_listener():
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, max_delay)
             logger.info("Telethon: попытка переподключения...")
-            # Уведомляем о восстановлении (если получится)
-            try:
-                await notify_callback("🔄 Telethon: попытка переподключения...")
-            except Exception:
-                pass
 
 
 _shutting_down = False
