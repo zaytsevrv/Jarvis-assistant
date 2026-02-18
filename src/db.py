@@ -285,6 +285,7 @@ async def get_dm_summary_data(since: datetime, limit: int = 100) -> list:
                      AND sender_id != $2
                      AND sender_id != ALL($3::bigint[])
                      AND chat_id = sender_id
+                     AND (account IS NULL OR account != 'bot_dialog')
                    GROUP BY sender_name, account
                    ORDER BY msg_count DESC
                    LIMIT $4""",
@@ -298,6 +299,7 @@ async def get_dm_summary_data(since: datetime, limit: int = 100) -> list:
                    WHERE timestamp >= $1
                      AND sender_id != $2
                      AND chat_id = sender_id
+                     AND (account IS NULL OR account != 'bot_dialog')
                    GROUP BY sender_name, account
                    ORDER BY msg_count DESC
                    LIMIT $3""",
@@ -444,7 +446,7 @@ async def build_context(query: str, max_chars: int = 50000) -> str:
 async def has_similar_active_task(description: str) -> bool:
     """Проверяет, есть ли уже активная задача с похожим описанием."""
     pool = await get_pool()
-    short = description[:50].strip()
+    short = description[:70].strip()
     if not short:
         return False
     async with pool.acquire() as conn:
@@ -464,6 +466,8 @@ async def create_task(
     source: Optional[str] = None,
     source_msg_id: Optional[int] = None,
     chat_id: Optional[int] = None,
+    remind_at: Optional[datetime] = None,
+    recurrence: Optional[str] = None,
 ) -> Optional[int]:
     """Создаёт задачу. Возвращает id или None если дубликат."""
     # Дедупликация
@@ -475,12 +479,39 @@ async def create_task(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO tasks
-               (type, description, who, deadline, confidence, source, source_msg_id, chat_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               (type, description, who, deadline, confidence, source, source_msg_id, chat_id,
+                remind_at, recurrence)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                RETURNING id""",
             task_type, description, who, deadline, confidence, source, source_msg_id, chat_id,
+            remind_at, recurrence,
         )
         return row["id"]
+
+
+async def get_timed_reminders() -> list:
+    """Возвращает задачи с remind_at <= NOW() для которых уведомление не отправлено."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, description, who, deadline, remind_at, recurrence
+               FROM tasks
+               WHERE remind_at IS NOT NULL
+                 AND reminder_sent = FALSE
+                 AND status = 'active'
+                 AND remind_at <= NOW()"""
+        )
+        return [dict(r) for r in rows]
+
+
+async def mark_reminder_sent(task_id: int):
+    """Помечает задачу как отправившую напоминание."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tasks SET reminder_sent = TRUE WHERE id = $1",
+            task_id,
+        )
 
 
 async def get_active_tasks() -> list:
@@ -492,6 +523,42 @@ async def get_active_tasks() -> list:
                ORDER BY deadline ASC NULLS LAST, created_at DESC"""
         )
         return [dict(r) for r in rows]
+
+
+async def get_user_preferences() -> dict:
+    """Возвращает настройки пользователя из таблицы settings."""
+    import json as _json
+    raw = await get_setting("user_preferences", '{"address": "ты", "emoji": true, "style": "business-casual"}')
+    try:
+        return _json.loads(raw)
+    except (_json.JSONDecodeError, TypeError):
+        return {"address": "ты", "emoji": True, "style": "business-casual"}
+
+
+async def save_deadline_notification(task_id: int, notif_date) -> int:
+    """Записывает или обновляет запись уведомления о дедлайне. Возвращает count."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO deadline_notifications (task_id, notif_date, count)
+               VALUES ($1, $2, 1)
+               ON CONFLICT (task_id, notif_date) DO UPDATE
+                 SET count = deadline_notifications.count + 1
+               RETURNING count""",
+            task_id, notif_date,
+        )
+        return row["count"] if row else 1
+
+
+async def get_deadline_notification_count(task_id: int, notif_date) -> int:
+    """Возвращает количество отправленных уведомлений о дедлайне для задачи."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT count FROM deadline_notifications WHERE task_id = $1 AND notif_date = $2",
+            task_id, notif_date,
+        )
+        return val or 0
 
 
 async def complete_task(task_id: int):

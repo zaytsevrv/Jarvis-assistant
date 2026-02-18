@@ -12,6 +12,8 @@ from src.db import (
     get_messages_since, get_dm_summary_data,
     get_tasks_completed_since, get_tasks_created_since,
     cleanup_conversation_history,
+    get_timed_reminders, mark_reminder_sent,
+    save_deadline_notification, get_deadline_notification_count,
 )
 from src.ai_brain import brain
 from src.confidence_manager import send_batch_review
@@ -23,9 +25,7 @@ scheduler: AsyncIOScheduler = None
 # Callback для отправки в бот
 _notify_callback = None
 
-# A6: Трекинг отправленных уведомлений о дедлайнах
-_deadline_notified: dict[int, int] = {}  # task_id → количество уведомлений за сегодня
-_deadline_notified_date: date = None
+# K4: Трекинг дедлайн-уведомлений теперь в БД (deadline_notifications), не в памяти
 
 
 def set_notify_callback(callback):
@@ -159,36 +159,77 @@ async def evening_digest():
         logger.error(f"Ошибка вечернего дайджеста: {e}", exc_info=True)
 
 
+async def check_timed_reminders():
+    """K1: Каждую минуту — проверка задач с remind_at <= NOW()."""
+    try:
+        tasks = await get_timed_reminders()
+        for t in tasks:
+            task_id = t["id"]
+            description = t["description"]
+            remind_at = t["remind_at"]
+            who = t.get("who") or ""
+            deadline = t.get("deadline")
+
+            # Форматируем уведомление
+            lines = [f"⏰ <b>Напоминание:</b> {description}"]
+            if who:
+                lines.append(f"👤 {who}")
+            if deadline:
+                lines.append(f"📅 Дедлайн: {deadline.strftime('%d.%m.%Y')}")
+
+            await notify_owner("\n".join(lines))
+            await mark_reminder_sent(task_id)
+            logger.info(f"Напоминание отправлено: #{task_id} '{description[:40]}'")
+    except Exception as e:
+        logger.error(f"Ошибка check_timed_reminders: {e}", exc_info=True)
+
+
 async def check_deadlines():
     """Каждый час — проверка приближающихся дедлайнов.
-    A6: Дедупликация — max 1 раз "завтра", max 2 раза "сегодня"."""
-    global _deadline_notified, _deadline_notified_date
+    K4: Счётчик в БД (deadline_notifications). Группировка в одном сообщении.
+    Max 2 уведомления "сегодня", max 1 уведомление "завтра"."""
     try:
         today = date.today()
-        # Сброс счётчика при новом дне
-        if _deadline_notified_date != today:
-            _deadline_notified = {}
-            _deadline_notified_date = today
-
         tasks = await get_active_tasks()
+
+        today_tasks = []
+        tomorrow_tasks = []
 
         for t in tasks:
             if not t.get("deadline"):
                 continue
             task_id = t["id"]
             days_left = (t["deadline"].date() - today).days
-            sent_count = _deadline_notified.get(task_id, 0)
 
-            if days_left == 0 and sent_count < 2:
-                await notify_owner(
-                    f"ДЕДЛАЙН СЕГОДНЯ: #{task_id} {t['description']}"
-                )
-                _deadline_notified[task_id] = sent_count + 1
-            elif days_left == 1 and sent_count < 1:
-                await notify_owner(
-                    f"Дедлайн ЗАВТРА: #{task_id} {t['description']}"
-                )
-                _deadline_notified[task_id] = sent_count + 1
+            if days_left == 0:
+                sent = await get_deadline_notification_count(task_id, today)
+                if sent < 2:
+                    today_tasks.append(t)
+            elif days_left == 1:
+                tomorrow = today + timedelta(days=1)
+                sent = await get_deadline_notification_count(task_id, tomorrow)
+                if sent < 1:
+                    tomorrow_tasks.append(t)
+
+        if not today_tasks and not tomorrow_tasks:
+            return  # Нечего уведомлять
+
+        lines = []
+        if today_tasks:
+            lines.append("⏰ <b>Дедлайны СЕГОДНЯ:</b>")
+            for t in today_tasks:
+                lines.append(f"  • #{t['id']} {t['description']}")
+                await save_deadline_notification(t["id"], today)
+
+        if tomorrow_tasks:
+            lines.append("📅 <b>Дедлайны ЗАВТРА:</b>")
+            for t in tomorrow_tasks:
+                lines.append(f"  • #{t['id']} {t['description']}")
+                tomorrow = today + timedelta(days=1)
+                await save_deadline_notification(t["id"], tomorrow)
+
+        await notify_owner("\n".join(lines))
+        logger.info(f"Дедлайны: {len(today_tasks)} сегодня, {len(tomorrow_tasks)} завтра")
     except Exception as e:
         logger.error(f"Ошибка проверки дедлайнов: {e}", exc_info=True)
 
@@ -255,6 +296,9 @@ async def start_scheduler():
 
     # Вечерний дайджест — 14:00 UTC = 21:00 Красноярск
     scheduler.add_job(evening_digest, CronTrigger(hour=config.DIGEST_HOUR, minute=0))
+
+    # K1: Проверка time-based напоминаний — каждую минуту
+    scheduler.add_job(check_timed_reminders, CronTrigger(minute="*"))
 
     # Проверка дедлайнов — каждый час
     scheduler.add_job(check_deadlines, CronTrigger(minute=30))

@@ -19,6 +19,7 @@ from src.db import (
     get_messages_since,
     get_setting,
     set_setting,
+    has_similar_active_task,
 )
 
 logger = logging.getLogger("jarvis.tools")
@@ -53,6 +54,19 @@ TOOL_DEFINITIONS = [
                 "who": {
                     "type": "string",
                     "description": "Кто должен выполнить (имя). Если задача для самого пользователя — null."
+                },
+                "remind_at": {
+                    "type": "string",
+                    "description": (
+                        "Конкретное время напоминания в формате YYYY-MM-DDTHH:MM (по Красноярску UTC+7). "
+                        "Если пользователь сказал 'в 11:00' или 'завтра в 11' — обязательно заполни. "
+                        "Если время не указано — null."
+                    )
+                },
+                "recurrence": {
+                    "type": "string",
+                    "enum": ["daily", "weekly", "monthly"],
+                    "description": "Повторение задачи. Заполняй только если пользователь явно попросил 'каждую неделю', 'ежемесячно' и т.д."
                 },
             },
             "required": ["description", "task_type"],
@@ -225,14 +239,41 @@ async def _tool_create_task(params: dict) -> dict:
     description = params["description"]
     task_type = params.get("task_type", "task")
     deadline_str = params.get("deadline")
+    remind_at_str = params.get("remind_at")
     who = params.get("who")
+    recurrence = params.get("recurrence")
+
+    # UTC+7 для Красноярска
+    TZ_OFFSET = timezone(timedelta(hours=7))
 
     deadline = None
     if deadline_str:
         try:
-            deadline = datetime.strptime(deadline_str, "%Y-%m-%d")
+            deadline = datetime.strptime(deadline_str, "%Y-%m-%d").replace(tzinfo=TZ_OFFSET)
         except ValueError:
             return {"error": f"Некорректный формат даты: {deadline_str}. Нужен YYYY-MM-DD."}
+
+    remind_at = None
+    if remind_at_str:
+        try:
+            # Формат YYYY-MM-DDTHH:MM, интерпретируем как Красноярское время
+            remind_at = datetime.fromisoformat(remind_at_str).replace(tzinfo=TZ_OFFSET)
+        except ValueError:
+            return {"error": f"Некорректный формат времени: {remind_at_str}. Нужен YYYY-MM-DDTHH:MM."}
+
+    # Улучшенный дедуп — возвращаем данные существующей задачи
+    existing = await _find_similar_task(description)
+    if existing:
+        return {
+            "status": "duplicate",
+            "message": "Похожая задача уже существует.",
+            "existing_task": {
+                "id": existing["id"],
+                "description": existing["description"],
+                "deadline": existing["deadline"].strftime("%d.%m.%Y") if existing.get("deadline") else None,
+                "remind_at": existing["remind_at"].strftime("%d.%m %H:%M") if existing.get("remind_at") else None,
+            }
+        }
 
     task_id = await create_task(
         task_type=task_type,
@@ -241,18 +282,38 @@ async def _tool_create_task(params: dict) -> dict:
         deadline=deadline,
         confidence=100,
         source="owner_dialog",
+        remind_at=remind_at,
+        recurrence=recurrence,
     )
 
     if task_id is None:
         return {"status": "duplicate", "message": "Похожая задача уже существует."}
+
+    remind_confirm = ""
+    if remind_at:
+        remind_confirm = remind_at.strftime("%d.%m в %H:%M")
 
     return {
         "status": "created",
         "task_id": task_id,
         "description": description,
         "deadline": deadline_str,
+        "remind_at": remind_at_str,
+        "remind_confirm": remind_confirm,
         "who": who,
+        "recurrence": recurrence,
     }
+
+
+async def _find_similar_task(description: str) -> Optional[dict]:
+    """Ищет похожую активную задачу, возвращает dict или None."""
+    tasks = await get_active_tasks()
+    desc_lower = description.lower().strip()[:70]
+    for t in tasks:
+        t_desc = t["description"].lower().strip()[:70]
+        if desc_lower in t_desc or t_desc in desc_lower:
+            return t
+    return None
 
 
 async def _tool_list_tasks(params: dict) -> dict:
@@ -276,6 +337,10 @@ async def _tool_list_tasks(params: dict) -> dict:
         }
         if t.get("deadline"):
             item["deadline"] = t["deadline"].strftime("%d.%m.%Y")
+        if t.get("remind_at"):
+            item["remind_at"] = t["remind_at"].strftime("%H:%M %d.%m")
+        if t.get("recurrence"):
+            item["recurrence"] = t["recurrence"]
         result.append(item)
 
     return {"status": "ok", "count": len(result), "tasks": result}
@@ -436,6 +501,43 @@ async def _tool_manage_whitelist(params: dict) -> dict:
     return {"error": f"Неизвестное действие: {action}"}
 
 
+async def _tool_update_preferences(params: dict) -> dict:
+    """Сохраняет пользовательские настройки в БД навсегда."""
+    import json as _json
+    key = params.get("key")
+    value = params.get("value")
+
+    ALLOWED_KEYS = {
+        "address": ["ты", "вы"],
+        "emoji": [True, False, "true", "false"],
+        "style": ["formal", "casual", "business-casual"],
+    }
+
+    if key not in ALLOWED_KEYS:
+        return {"error": f"Недопустимый ключ настройки: {key}. Доступны: {list(ALLOWED_KEYS.keys())}"}
+
+    allowed_values = ALLOWED_KEYS[key]
+    # Нормализация булевых
+    if key == "emoji":
+        value = value in [True, "true", "True", 1]
+
+    raw = await get_setting("user_preferences", '{"address": "ты", "emoji": true, "style": "business-casual"}')
+    try:
+        prefs = _json.loads(raw)
+    except Exception:
+        prefs = {"address": "ты", "emoji": True, "style": "business-casual"}
+
+    prefs[key] = value
+    await set_setting("user_preferences", _json.dumps(prefs, ensure_ascii=False))
+
+    labels = {"address": "обращение", "emoji": "эмодзи", "style": "стиль"}
+    return {
+        "status": "saved",
+        "message": f"Настройка '{labels.get(key, key)}' сохранена навсегда: {value}",
+        "preferences": prefs,
+    }
+
+
 # Маппинг имя → обработчик
 _TOOL_HANDLERS = {
     "create_task": _tool_create_task,
@@ -446,4 +548,5 @@ _TOOL_HANDLERS = {
     "search_memory": _tool_search_memory,
     "get_chat_summary": _tool_get_chat_summary,
     "manage_whitelist": _tool_manage_whitelist,
+    "update_preferences": _tool_update_preferences,
 }

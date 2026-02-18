@@ -35,6 +35,7 @@ from src.db import (
     set_setting,
     complete_task,
     cancel_task,
+    get_user_preferences,
 )
 from src.ai_brain import brain
 from src.telegram_listener import resolve_chat_names
@@ -1160,6 +1161,16 @@ async def _build_dynamic_context() -> str:
     if dm_data:
         dm_names = [f"{d['sender_name']} ({d['msg_count']})" for d in dm_data[:8]]
         parts.append(f"Свежие ЛС за 12ч: {', '.join(dm_names)}.")
+
+    # Z3: Персональные настройки пользователя
+    prefs = await get_user_preferences()
+    address = prefs.get("address", "ты")
+    style = prefs.get("style", "business-casual")
+    emoji_ok = prefs.get("emoji", True)
+    parts.append(
+        f"Настройки общения: обращение на '{address}', стиль '{style}', "
+        f"emoji {'разрешены' if emoji_ok else 'запрещены'}."
+    )
 
     return "\n".join(parts)
 

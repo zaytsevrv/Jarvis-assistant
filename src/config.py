@@ -85,7 +85,7 @@ CONVERSATION_WINDOW_SIZE = _get_int("CONVERSATION_WINDOW_SIZE", 20)
 HEARTBEAT_INTERVAL_SEC = 300        # 5 минут
 CONFIDENCE_HIGH = 80                # >80% — молча создаёт
 CONFIDENCE_LOW = 50                 # <50% — молча в info
-CONFIDENCE_BATCH_HOUR = 10          # 10:00 UTC = 17:00 Красноярск
+CONFIDENCE_BATCH_HOUR = 13          # 13:00 UTC = 20:00 Красноярск (M4)
 CONFIDENCE_DAILY_LIMIT = 10         # макс вопросов/день
 BRIEFING_HOUR = 2                   # 02:00 UTC = 09:00 Красноярск
 DIGEST_HOUR = 14                    # 14:00 UTC = 21:00 Красноярск

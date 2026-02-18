@@ -300,8 +300,9 @@ async def on_new_message(event, account_label: str = ""):
                     f"Чат: {chat_title}",
                 )
 
-        # Классификация AI — для whitelist и личных чатов, НО НЕ для чата с ботом
-        if text and len(text) > 5 and not is_bot_chat:
+        # K3: Классификация AI — ТОЛЬКО для whitelist-чатов, НЕ для ЛС и НЕ для чата с ботом
+        # ЛС сохраняются в БД (для search_memory), но задачи из них создаются только по явной просьбе
+        if text and len(text) > 5 and not is_bot_chat and in_whitelist:
             if _classify_callback:
                 # A9: mark_processed вызывается ПОСЛЕ классификации (в callback)
                 asyncio.create_task(
