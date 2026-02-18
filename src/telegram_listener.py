@@ -124,7 +124,6 @@ async def start_listener():
             "label": config.ACCOUNT_LABEL_2,
         })
 
-    run_tasks = []
     for acc in accounts:
         client = TelegramClient(
             acc["session"],
@@ -139,13 +138,37 @@ async def start_listener():
         )
         _clients.append(client)
         logger.info(f"Telethon: аккаунт [{acc['label']}] подключён")
-        run_tasks.append(client.run_until_disconnected())
 
     # Heartbeat
     asyncio.create_task(_heartbeat_loop())
 
-    # Держим все клиенты запущенными
-    await asyncio.gather(*run_tasks)
+    # Держим все клиенты запущенными с retry при Telegram-ошибках
+    while True:
+        try:
+            run_tasks = [c.run_until_disconnected() for c in _clients if c.is_connected()]
+            if not run_tasks:
+                # Все клиенты отключены — переподключаемся
+                logger.warning("Telethon: все клиенты отключены, переподключение через 30с...")
+                await asyncio.sleep(30)
+                for client in _clients:
+                    try:
+                        await client.connect()
+                    except Exception as e:
+                        logger.error(f"Telethon reconnect error: {e}")
+                continue
+            await asyncio.gather(*run_tasks)
+            break  # Нормальное завершение (shutdown)
+        except Exception as e:
+            logger.error(f"Telethon connection error: {e}, retry in 30s...")
+            await asyncio.sleep(30)
+            # Переподключаем упавшие клиенты
+            for client in _clients:
+                if not client.is_connected():
+                    try:
+                        await client.connect()
+                        logger.info("Telethon: клиент переподключён")
+                    except Exception as re:
+                        logger.error(f"Telethon reconnect error: {re}")
 
 
 # Кеш названий чатов (B4: TTL 5 мин)
