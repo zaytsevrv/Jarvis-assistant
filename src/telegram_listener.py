@@ -143,11 +143,22 @@ async def start_listener():
     asyncio.create_task(_heartbeat_loop())
 
     # Держим все клиенты запущенными с retry при Telegram-ошибках
+    _telethon_down_since = None
+    _notified_down = False
+
     while True:
         try:
             run_tasks = [c.run_until_disconnected() for c in _clients if c.is_connected()]
             if not run_tasks:
-                # Все клиенты отключены — переподключаемся
+                # Все клиенты отключены — уведомляем и переподключаемся
+                if not _notified_down:
+                    _telethon_down_since = time.monotonic()
+                    _notified_down = True
+                    await notify_owner(
+                        "⚠️ <b>Telethon отключён</b>\n"
+                        "Мониторинг чатов не работает. Бот отвечает, но не видит новые сообщения.\n"
+                        "Попытка переподключения каждые 30 сек."
+                    )
                 logger.warning("Telethon: все клиенты отключены, переподключение через 30с...")
                 await asyncio.sleep(30)
                 for client in _clients:
@@ -156,10 +167,44 @@ async def start_listener():
                     except Exception as e:
                         logger.error(f"Telethon reconnect error: {e}")
                 continue
-            await asyncio.gather(*run_tasks)
-            break  # Нормальное завершение (shutdown)
+
+            # Если были отключены — уведомляем о восстановлении
+            if _notified_down:
+                downtime = int((time.monotonic() - _telethon_down_since) / 60) if _telethon_down_since else 0
+                await notify_owner(
+                    f"✅ <b>Telethon восстановлен</b>\n"
+                    f"Мониторинг чатов снова работает."
+                    + (f" Простой: ~{downtime} мин." if downtime > 0 else "")
+                )
+                _notified_down = False
+                _telethon_down_since = None
+
+            # return_exceptions=True чтобы краш одного клиента не убивал всё
+            results = await asyncio.gather(*run_tasks, return_exceptions=True)
+            # Проверяем результаты
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error(f"Telethon client error: {r}")
+            # Если все завершились без ошибок — нормальный shutdown
+            if not any(isinstance(r, Exception) for r in results):
+                break
+
+            # Были ошибки — переподключаемся
+            logger.warning("Telethon: ошибки клиентов, retry через 30с...")
+            await asyncio.sleep(30)
+
         except Exception as e:
-            logger.error(f"Telethon connection error: {e}, retry in 30s...")
+            logger.error(f"Telethon fatal error: {e}, retry in 30s...")
+            if not _notified_down:
+                _telethon_down_since = time.monotonic()
+                _notified_down = True
+                try:
+                    await notify_owner(
+                        f"⚠️ <b>Telethon упал</b>: {str(e)[:100]}\n"
+                        "Мониторинг чатов не работает. Переподключение через 30 сек."
+                    )
+                except Exception:
+                    pass
             await asyncio.sleep(30)
             # Переподключаем упавшие клиенты
             for client in _clients:
