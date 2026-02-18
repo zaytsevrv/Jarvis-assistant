@@ -89,7 +89,7 @@ async def main():
     # 3. Запуск модулей параллельно
     tasks = [
         asyncio.create_task(start_bot(), name="telegram_bot"),
-        asyncio.create_task(start_listener(), name="telegram_listener"),
+        asyncio.create_task(_resilient_listener(), name="telegram_listener"),
         asyncio.create_task(start_watchdog(), name="watchdog"),
     ]
 
@@ -103,6 +103,42 @@ async def main():
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         logger.info("Получен сигнал остановки")
+
+
+async def _resilient_listener():
+    """Wrapper: перезапускает Telethon при крашах, не убивая бот и scheduler."""
+    retry_delay = 30
+    max_delay = 300  # 5 мин максимум
+
+    while not _shutting_down:
+        try:
+            await start_listener()
+            break  # Нормальное завершение (shutdown)
+        except Exception as e:
+            logger.error(f"Telethon crashed: {e}")
+            # Уведомляем владельца
+            try:
+                await notify_callback(
+                    f"⚠️ <b>Telethon упал</b>: {str(e)[:100]}\n"
+                    "Мониторинг чатов не работает. Бот отвечает, но не видит сообщения.\n"
+                    f"Автоперезапуск через {retry_delay} сек."
+                )
+            except Exception:
+                pass
+            # Чистим клиенты
+            try:
+                await stop_listener()
+            except Exception:
+                pass
+            # Ждём перед ретраем (exponential backoff)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_delay)
+            logger.info("Telethon: попытка переподключения...")
+            # Уведомляем о восстановлении (если получится)
+            try:
+                await notify_callback("🔄 Telethon: попытка переподключения...")
+            except Exception:
+                pass
 
 
 _shutting_down = False
