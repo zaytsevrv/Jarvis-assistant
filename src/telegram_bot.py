@@ -36,6 +36,8 @@ from src.db import (
     complete_task,
     cancel_task,
     get_user_preferences,
+    update_task_last_checked,
+    postpone_task_deadline,
 )
 from src.ai_brain import brain
 from src.telegram_listener import resolve_chat_names
@@ -165,6 +167,35 @@ async def notify_callback(text: str, **kwargs):
                 InlineKeyboardButton(text="Выбрать", callback_data=f"batch_pick:{ids_str}"),
             ]
         ])
+
+    elif markup_type == "track_completed":
+        task_id = kwargs.get("task_id", 0)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Закрыть", callback_data=f"track_close:{task_id}"),
+                InlineKeyboardButton(text="⏰ Ещё ждём", callback_data=f"track_wait:{task_id}"),
+            ]
+        ])
+
+    elif markup_type == "track_pending":
+        task_id = kwargs.get("task_id", 0)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Закрыть", callback_data=f"track_close:{task_id}"),
+                InlineKeyboardButton(text="⏰ Ждём", callback_data=f"track_wait:{task_id}"),
+            ]
+        ])
+
+    elif markup_type == "evening_review":
+        review_ids = kwargs.get("review_task_ids", [])
+        buttons = []
+        for tid in review_ids[:10]:
+            buttons.append([
+                InlineKeyboardButton(text=f"✅ #{tid} Выполнена", callback_data=f"review_done:{tid}"),
+                InlineKeyboardButton(text=f"➡️ #{tid} Завтра", callback_data=f"review_tomorrow:{tid}"),
+            ])
+        if buttons:
+            markup = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await send_to_owner(text, reply_markup=markup)
 
@@ -438,6 +469,64 @@ async def cb_batch_pick(callback: CallbackQuery):
         await callback.message.edit_text("Выбери по каждому:", reply_markup=markup)
     else:
         await callback.answer("Нет неразрешённых вопросов")
+
+
+# ─── v4: Callback-обработчики мониторинга задач ──────────────
+
+@router.callback_query(F.data.startswith("track_close:"))
+async def cb_track_close(callback: CallbackQuery):
+    """Закрыть отслеживаемую задачу (выполнена)."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    task_id = int(callback.data.split(":")[1])
+    await complete_task(task_id)
+    await callback.answer(f"Задача #{task_id} закрыта")
+    try:
+        await callback.message.edit_text(
+            callback.message.text + "\n\n✅ Закрыта",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("track_wait:"))
+async def cb_track_wait(callback: CallbackQuery):
+    """Ждём — обновляем last_checked_at, проверим в следующий цикл."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    task_id = int(callback.data.split(":")[1])
+    await update_task_last_checked(task_id)
+    await callback.answer(f"Задача #{task_id}: проверим позже")
+    try:
+        await callback.message.edit_text(
+            callback.message.text + "\n\n⏰ Проверю позже",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+# ─── v4: Callback-обработчики вечернего review ──────────────
+
+@router.callback_query(F.data.startswith("review_done:"))
+async def cb_review_done(callback: CallbackQuery):
+    """Вечерний review: задача выполнена."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    task_id = int(callback.data.split(":")[1])
+    await complete_task(task_id)
+    await callback.answer(f"✅ #{task_id} выполнена")
+
+
+@router.callback_query(F.data.startswith("review_tomorrow:"))
+async def cb_review_tomorrow(callback: CallbackQuery):
+    """Вечерний review: перенести дедлайн на завтра."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    task_id = int(callback.data.split(":")[1])
+    await postpone_task_deadline(task_id, days=1)
+    await callback.answer(f"➡️ #{task_id} перенесена на завтра")
 
 
 @router.callback_query(F.data.startswith("admin:"))

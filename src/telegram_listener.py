@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
 from telethon.tl.types import (
+    Channel,
     MessageMediaDocument,
     MessageMediaPhoto,
     MessageService,
@@ -288,8 +289,12 @@ async def on_new_message(event, account_label: str = ""):
         # диалог owner↔bot обрабатывается через handle_free_text с tools
         is_bot_chat = (is_private and (sender_id == _bot_id or chat_id == _bot_id))
 
-        # Проверка: новый контакт? (только для whitelist, не бот)
-        if in_whitelist and sender_id and sender_id != config.TELEGRAM_OWNER_ID and not is_bot_chat:
+        # v4: Определяем тип sender — канал (Channel) не является контактом
+        is_channel = isinstance(sender, Channel)
+
+        # Проверка: новый контакт? (только для whitelist, не бот, не канал, не владелец)
+        if (in_whitelist and sender_id and not config.is_owner(sender_id)
+                and not is_bot_chat and not is_channel):
             is_known = await is_known_contact(sender_id)
             if not is_known:
                 contact = await get_or_create_contact(sender_id, sender_name)
@@ -300,13 +305,21 @@ async def on_new_message(event, account_label: str = ""):
                     f"Чат: {chat_title}",
                 )
 
+        # v4: Каналы из whitelist — сохраняем для дайджеста, но НЕ классифицируем
+        if is_channel:
+            await mark_message_processed(db_msg_id)
+            return
+
         # K3: Классификация AI — ТОЛЬКО для whitelist-чатов, НЕ для ЛС и НЕ для чата с ботом
         # ЛС сохраняются в БД (для search_memory), но задачи из них создаются только по явной просьбе
         if text and len(text) > 5 and not is_bot_chat and in_whitelist:
             if _classify_callback:
-                # A9: mark_processed вызывается ПОСЛЕ классификации (в callback)
+                # v4: передаём sender_id и account для контекста
                 asyncio.create_task(
-                    _classify_and_mark(db_msg_id, text, sender_name, chat_title, chat_id)
+                    _classify_and_mark(
+                        db_msg_id, text, sender_name, chat_title,
+                        chat_id, sender_id, account_label,
+                    )
                 )
                 return  # mark_processed будет вызван в _classify_and_mark
 
@@ -367,11 +380,16 @@ def _get_media_type(msg) -> str | None:
     return None
 
 
-async def _classify_and_mark(db_msg_id, text, sender_name, chat_title, chat_id):
-    """Классифицирует сообщение, затем помечает как обработанное (A9)."""
+async def _classify_and_mark(db_msg_id, text, sender_name, chat_title, chat_id,
+                             sender_id=0, account_label=""):
+    """Классифицирует сообщение, затем помечает как обработанное (A9).
+    v4: передаёт sender_id и account_label для контекста задач."""
     try:
         if _classify_callback:
-            await _classify_callback(db_msg_id, text, sender_name, chat_title, chat_id)
+            await _classify_callback(
+                db_msg_id, text, sender_name, chat_title, chat_id,
+                sender_id=sender_id, account_label=account_label,
+            )
     except Exception as e:
         logger.error(f"Ошибка классификации #{db_msg_id}: {e}", exc_info=True)
     finally:

@@ -21,6 +21,18 @@ TELEGRAM_API_HASH = _get("TELEGRAM_API_HASH")
 TELEGRAM_PHONE = _get("TELEGRAM_PHONE")
 TELEGRAM_BOT_TOKEN = _get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_OWNER_ID = _get_int("TELEGRAM_OWNER_ID")
+TELEGRAM_OWNER_ID_2 = _get_int("TELEGRAM_OWNER_ID_2", 0)
+
+# Множество всех ID владельца (для быстрой проверки)
+OWNER_IDS: set[int] = {TELEGRAM_OWNER_ID}
+if TELEGRAM_OWNER_ID_2:
+    OWNER_IDS.add(TELEGRAM_OWNER_ID_2)
+
+
+def is_owner(sender_id: int) -> bool:
+    """Проверяет, является ли sender_id одним из аккаунтов владельца."""
+    return sender_id in OWNER_IDS
+
 
 # === Telegram: второй аккаунт ===
 TELEGRAM_API_ID_2 = _get_int("TELEGRAM_API_ID_2", 0)
@@ -83,7 +95,7 @@ CONVERSATION_WINDOW_SIZE = _get_int("CONVERSATION_WINDOW_SIZE", 20)
 
 # === Константы ===
 HEARTBEAT_INTERVAL_SEC = 300        # 5 минут
-CONFIDENCE_HIGH = 80                # >80% — молча создаёт
+CONFIDENCE_HIGH = 90                # >90% — молча создаёт (v4: было 80)
 CONFIDENCE_LOW = 50                 # <50% — молча в info
 CONFIDENCE_BATCH_HOUR = 13          # 13:00 UTC = 20:00 Красноярск (M4)
 CONFIDENCE_DAILY_LIMIT = 10         # макс вопросов/день

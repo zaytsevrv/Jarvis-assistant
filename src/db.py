@@ -275,36 +275,24 @@ async def get_dm_summary_data(since: datetime, limit: int = 100) -> list:
     except _json.JSONDecodeError:
         bl_ids = []
 
+    # v4: исключаем оба аккаунта владельца
+    owner_ids = list(config.OWNER_IDS)
+
     async with pool.acquire() as conn:
-        if bl_ids:
-            rows = await conn.fetch(
-                """SELECT sender_name, account, COUNT(*) as msg_count,
-                          STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
-                   FROM messages
-                   WHERE timestamp >= $1
-                     AND sender_id != $2
-                     AND sender_id != ALL($3::bigint[])
-                     AND chat_id = sender_id
-                     AND (account IS NULL OR account != 'bot_dialog')
-                   GROUP BY sender_name, account
-                   ORDER BY msg_count DESC
-                   LIMIT $4""",
-                since, config.TELEGRAM_OWNER_ID, bl_ids, limit,
-            )
-        else:
-            rows = await conn.fetch(
-                """SELECT sender_name, account, COUNT(*) as msg_count,
-                          STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
-                   FROM messages
-                   WHERE timestamp >= $1
-                     AND sender_id != $2
-                     AND chat_id = sender_id
-                     AND (account IS NULL OR account != 'bot_dialog')
-                   GROUP BY sender_name, account
-                   ORDER BY msg_count DESC
-                   LIMIT $3""",
-                since, config.TELEGRAM_OWNER_ID, limit,
-            )
+        exclude_ids = owner_ids + bl_ids
+        rows = await conn.fetch(
+            """SELECT sender_name, account, COUNT(*) as msg_count,
+                      STRING_AGG(LEFT(text, 100), ' | ' ORDER BY timestamp) as previews
+               FROM messages
+               WHERE timestamp >= $1
+                 AND sender_id != ALL($2::bigint[])
+                 AND chat_id = sender_id
+                 AND (account IS NULL OR account != 'bot_dialog')
+               GROUP BY sender_name, account
+               ORDER BY msg_count DESC
+               LIMIT $3""",
+            since, exclude_ids, limit,
+        )
         return [dict(r) for r in rows]
 
 
@@ -468,6 +456,11 @@ async def create_task(
     chat_id: Optional[int] = None,
     remind_at: Optional[datetime] = None,
     recurrence: Optional[str] = None,
+    sender_id: Optional[int] = None,
+    sender_name: Optional[str] = None,
+    telegram_msg_id: Optional[int] = None,
+    account: Optional[str] = None,
+    track_completion: bool = False,
 ) -> Optional[int]:
     """Создаёт задачу. Возвращает id или None если дубликат."""
     # Дедупликация
@@ -480,11 +473,13 @@ async def create_task(
         row = await conn.fetchrow(
             """INSERT INTO tasks
                (type, description, who, deadline, confidence, source, source_msg_id, chat_id,
-                remind_at, recurrence)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                remind_at, recurrence, sender_id, sender_name, telegram_msg_id, account,
+                track_completion)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                RETURNING id""",
             task_type, description, who, deadline, confidence, source, source_msg_id, chat_id,
-            remind_at, recurrence,
+            remind_at, recurrence, sender_id, sender_name, telegram_msg_id, account,
+            track_completion,
         )
         return row["id"]
 
@@ -561,6 +556,83 @@ async def get_deadline_notification_count(task_id: int, notif_date) -> int:
         return val or 0
 
 
+async def get_messages_around(msg_db_id: int, chat_id: int, window: int = 2) -> list:
+    """Возвращает окно сообщений вокруг указанного (±window штук из того же чата).
+    v4: контекстное окно для классификатора."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """(SELECT id, sender_id, sender_name, text, timestamp
+                FROM messages WHERE chat_id = $2 AND id <= $1
+                ORDER BY id DESC LIMIT $3)
+               UNION ALL
+              (SELECT id, sender_id, sender_name, text, timestamp
+                FROM messages WHERE chat_id = $2 AND id > $1
+                ORDER BY id ASC LIMIT $3)
+               ORDER BY id ASC""",
+            msg_db_id, chat_id, window + 1,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_recent_chat_messages(chat_id: int, since: datetime, limit: int = 30) -> list:
+    """Получает последние сообщения из чата за период. v4: для мониторинга задач."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT sender_id, sender_name, text, timestamp
+               FROM messages
+               WHERE chat_id = $1 AND timestamp >= $2
+               ORDER BY timestamp DESC
+               LIMIT $3""",
+            chat_id, since, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_tracked_tasks_to_check() -> list:
+    """Возвращает задачи для проверки выполнения.
+    v4: track_completion=TRUE, active, и пора проверять (last_checked_at + interval)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT t.*, m.telegram_msg_id as orig_tg_msg_id
+               FROM tasks t
+               LEFT JOIN messages m ON t.source_msg_id = m.id
+               WHERE t.track_completion = TRUE
+                 AND t.status = 'active'
+                 AND (t.last_checked_at IS NULL
+                      OR t.last_checked_at + (t.check_interval_days || ' days')::interval <= NOW())"""
+        )
+        return [dict(r) for r in rows]
+
+
+async def update_task_last_checked(task_id: int):
+    """Обновляет last_checked_at после проверки выполнения задачи."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tasks SET last_checked_at = NOW() WHERE id = $1",
+            task_id,
+        )
+
+
+def build_message_link(chat_id: int, telegram_msg_id: int) -> str:
+    """Строит deep link на сообщение в Telegram.
+    Для supergroup/channel: https://t.me/c/{id}/{msg_id}
+    Для ЛС: пустая строка (нет прямой ссылки на сообщение)."""
+    if not chat_id or not telegram_msg_id:
+        return ""
+    chat_str = str(chat_id)
+    # Supergroup/channel IDs: -100XXXXXXXXXX → XXXXXXXXXX
+    if chat_str.startswith("-100"):
+        normalized = chat_str[4:]
+        return f"https://t.me/c/{normalized}/{telegram_msg_id}"
+    # Обычные группы: -XXXXXXXXX — ссылка не поддерживается
+    # ЛС: положительные ID — ссылка не поддерживается
+    return ""
+
+
 async def complete_task(task_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -577,6 +649,18 @@ async def cancel_task(task_id: int):
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE tasks SET status = 'cancelled' WHERE id = $1", task_id
+        )
+
+
+async def postpone_task_deadline(task_id: int, days: int = 1):
+    """Сдвигает дедлайн задачи на N дней вперёд. v4: для evening review."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE tasks
+               SET deadline = COALESCE(deadline, NOW()) + ($2 || ' days')::interval
+               WHERE id = $1""",
+            task_id, str(days),
         )
 
 

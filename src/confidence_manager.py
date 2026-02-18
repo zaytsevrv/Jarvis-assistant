@@ -9,6 +9,7 @@ from src.db import (
     get_setting,
     resolve_confidence,
     mark_message_processed,
+    get_messages_around,
 )
 from src.ai_brain import brain
 
@@ -49,10 +50,23 @@ async def process_classification(
     sender_name: str,
     chat_title: str,
     chat_id: int,
+    sender_id: int = 0,
+    account_label: str = "",
 ):
-    """Классификация сообщения AI и обработка по уровню confidence."""
+    """Классификация сообщения AI и обработка по уровню confidence.
+    v4: контекстное окно + направление + sender_id."""
     try:
-        result = await brain.classify_message(text, sender_name, chat_title)
+        # v4: загружаем контекстное окно (±2 сообщения из того же чата)
+        context_messages = await get_messages_around(db_msg_id, chat_id, window=2)
+
+        # v4: определяем направление — от владельца или к владельцу
+        owner_is_sender = config.is_owner(sender_id) if sender_id else False
+
+        result = await brain.classify_message(
+            text, sender_name, chat_title,
+            context_messages=context_messages,
+            owner_is_sender=owner_is_sender,
+        )
 
         msg_type = result.get("type", "info")
         confidence = result.get("confidence", 0)
@@ -60,6 +74,7 @@ async def process_classification(
         deadline_str = result.get("deadline")
         who = result.get("who")
         is_urgent = result.get("is_urgent", False)
+        assignee = result.get("assignee")  # v4: кому назначена задача
 
         # Парсинг дедлайна
         deadline = None
@@ -69,19 +84,29 @@ async def process_classification(
             except (ValueError, TypeError):
                 pass
 
+        # v4: определяем нужно ли отслеживать (task_from_me = исходящая задача)
+        track = msg_type == "task_from_me"
+        # Нормализуем тип для БД (task_from_me/task_for_me → task в таблице)
+        if msg_type in ("task_from_me", "task_for_me"):
+            msg_type = "task"
+
         # Три зоны confidence
         if confidence > config.CONFIDENCE_HIGH:
-            # >80% — молча создаёт задачу
+            # >90% — молча создаёт задачу
             if msg_type in ("task", "promise_mine", "promise_incoming"):
                 task_id = await create_task(
                     task_type=msg_type,
                     description=summary,
-                    who=who,
+                    who=who or assignee,
                     deadline=deadline,
                     confidence=confidence,
                     source=f"telegram:{chat_title}",
                     source_msg_id=db_msg_id,
                     chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    account=account_label,
+                    track_completion=track,
                 )
                 logger.info(f"Задача #{task_id} создана (confidence {confidence}%): {summary}")
 
