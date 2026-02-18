@@ -128,22 +128,25 @@ async def evening_digest():
         system_line = f"\nСИСТЕМА: {stats.get('db_size', '?')} БД"
         await notify_owner(digest + system_line)
 
-        # v4: Вечерний review — задачи с дедлайном сегодня/просроченные
-        today = date.today()
-        review_tasks = [
-            t for t in tasks
-            if t.get("deadline") and t["deadline"].date() <= today
-        ]
-        if review_tasks:
-            lines = ["📋 <b>ЗАДАЧИ С ДЕДЛАЙНОМ СЕГОДНЯ:</b>"]
-            for t in review_tasks:
+        # v4: Вечерний review — ВСЕ активные задачи с кнопками
+        if tasks:
+            today = date.today()
+            lines = ["📋 <b>АКТИВНЫЕ ЗАДАЧИ — REVIEW:</b>"]
+            for t in tasks[:15]:
                 who_str = f" [{t['who']}]" if t.get("who") else ""
-                overdue = " ⚠️ просрочена" if t["deadline"].date() < today else ""
-                lines.append(f"  • #{t['id']} {t['description']}{who_str}{overdue}")
+                deadline_str = ""
+                if t.get("deadline"):
+                    if t["deadline"].date() < today:
+                        deadline_str = f" ⚠️ просрочена ({t['deadline'].strftime('%d.%m')})"
+                    elif t["deadline"].date() == today:
+                        deadline_str = " 📅 сегодня"
+                    else:
+                        deadline_str = f" 📅 {t['deadline'].strftime('%d.%m')}"
+                lines.append(f"  • #{t['id']} {t['description']}{who_str}{deadline_str}")
             await notify_owner(
                 "\n".join(lines),
                 reply_markup_type="evening_review",
-                review_task_ids=[t["id"] for t in review_tasks],
+                review_task_ids=[t["id"] for t in tasks[:10]],
             )
 
         # Summary по whitelist-группам за день
