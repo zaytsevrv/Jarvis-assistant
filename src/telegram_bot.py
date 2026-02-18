@@ -189,11 +189,16 @@ async def notify_callback(text: str, **kwargs):
     elif markup_type == "evening_review":
         review_ids = kwargs.get("review_task_ids", [])
         buttons = []
+        # Компактные кнопки: по 2 задачи в ряд (4 кнопки на строку)
+        row = []
         for tid in review_ids[:10]:
-            buttons.append([
-                InlineKeyboardButton(text=f"✅ #{tid} Выполнена", callback_data=f"review_done:{tid}"),
-                InlineKeyboardButton(text=f"➡️ #{tid} Завтра", callback_data=f"review_tomorrow:{tid}"),
-            ])
+            row.append(InlineKeyboardButton(text=f"✅ #{tid}", callback_data=f"review_done:{tid}"))
+            row.append(InlineKeyboardButton(text=f"➡️ #{tid}", callback_data=f"review_tomorrow:{tid}"))
+            if len(row) >= 4:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
         if buttons:
             markup = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1209,6 +1214,18 @@ async def handle_free_text(message: Message):
 
         # 7. Отправляем ответ
         await send_to_owner(answer_text)
+
+        # 8. Если AI показывал задачи — добавляем кнопки управления
+        tool_calls = result.get("tool_calls") or []
+        used_list_tasks = any(tc.get("name") == "list_tasks" for tc in tool_calls)
+        if used_list_tasks:
+            tasks = await get_active_tasks()
+            if tasks:
+                await notify_callback(
+                    "Управление задачами:",
+                    reply_markup_type="evening_review",
+                    review_task_ids=[t["id"] for t in tasks[:10]],
+                )
 
     except Exception as e:
         logger.error(f"handle_free_text error: {e}", exc_info=True)
