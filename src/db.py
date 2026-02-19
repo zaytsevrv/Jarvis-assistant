@@ -489,12 +489,14 @@ async def get_timed_reminders() -> list:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT id, description, who, deadline, remind_at, recurrence
-               FROM tasks
-               WHERE remind_at IS NOT NULL
-                 AND reminder_sent = FALSE
-                 AND status = 'active'
-                 AND remind_at <= NOW()"""
+            """SELECT t.id, t.description, t.who, t.deadline, t.remind_at, t.recurrence,
+                      t.chat_id, t.telegram_msg_id, m.telegram_msg_id as orig_tg_msg_id
+               FROM tasks t
+               LEFT JOIN messages m ON t.source_msg_id = m.id
+               WHERE t.remind_at IS NOT NULL
+                 AND t.reminder_sent = FALSE
+                 AND t.status = 'active'
+                 AND t.remind_at <= NOW()"""
         )
         return [dict(r) for r in rows]
 

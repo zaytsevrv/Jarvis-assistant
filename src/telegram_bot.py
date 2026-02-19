@@ -186,6 +186,14 @@ async def notify_callback(text: str, **kwargs):
             ]
         ])
 
+    elif markup_type == "reminder":
+        task_id = kwargs.get("task_id", 0)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"✅ Выполнено #{task_id}", callback_data=f"review_done:{task_id}"),
+            ]
+        ])
+
     elif markup_type == "evening_review":
         review_ids = kwargs.get("review_task_ids", [])
         buttons = []
@@ -1155,7 +1163,7 @@ async def handle_photo(message: Message):
             context=context,
             system_context=system_context,
         )
-        await send_to_owner(html_lib.escape(answer))
+        await send_to_owner(answer)
     except Exception as e:
         logger.error(f"Vision error: {e}", exc_info=True)
         await send_to_owner(f"Не удалось проанализировать изображение: {html_lib.escape(str(e))}")

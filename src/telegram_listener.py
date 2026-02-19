@@ -324,18 +324,9 @@ async def on_new_message(event, account_label: str = ""):
             await mark_message_processed(db_msg_id)
             return
 
-        # K3: Классификация AI — ТОЛЬКО для whitelist-чатов, НЕ для ЛС и НЕ для чата с ботом
-        # ЛС сохраняются в БД (для search_memory), но задачи из них создаются только по явной просьбе
-        if text and len(text) > 5 and not is_bot_chat and in_whitelist:
-            if _classify_callback:
-                # v4: передаём sender_id и account для контекста
-                asyncio.create_task(
-                    _classify_and_mark(
-                        db_msg_id, text, sender_name, chat_title,
-                        chat_id, sender_id, account_label,
-                    )
-                )
-                return  # mark_processed будет вызван в _classify_and_mark
+        # v5: Классификация ОТКЛЮЧЕНА для whitelist-групп — задач там не бывает,
+        # сообщения сохраняются только для дайджеста (morning/evening summary).
+        # ЛС сохраняются для search_memory. Задачи создаются только по явной просьбе через бот-чат.
 
         await mark_message_processed(db_msg_id)
 

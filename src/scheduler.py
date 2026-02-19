@@ -194,13 +194,24 @@ async def check_timed_reminders():
             deadline = t.get("deadline")
 
             # Форматируем уведомление
-            lines = [f"⏰ <b>Напоминание:</b> {description}"]
+            lines = [f"⏰ <b>Напоминание:</b> #{task_id} {description}"]
             if who:
                 lines.append(f"👤 {who}")
             if deadline:
                 lines.append(f"📅 Дедлайн: {deadline.strftime('%d.%m.%Y')}")
 
-            await notify_owner("\n".join(lines))
+            # Deep link на исходное сообщение
+            chat_id = t.get("chat_id") or 0
+            orig_msg_id = t.get("telegram_msg_id") or t.get("orig_tg_msg_id") or 0
+            link = build_message_link(chat_id, orig_msg_id)
+            if link:
+                lines.append(f'<a href="{link}">📎 Перейти к сообщению</a>')
+
+            await notify_owner(
+                "\n".join(lines),
+                reply_markup_type="reminder",
+                task_id=task_id,
+            )
             await mark_reminder_sent(task_id)
             logger.info(f"Напоминание отправлено: #{task_id} '{description[:40]}'")
     except Exception as e:
@@ -271,51 +282,34 @@ async def check_tracked_tasks():
 
 
 async def check_deadlines():
-    """Каждый час — проверка приближающихся дедлайнов.
-    K4: Счётчик в БД (deadline_notifications). Группировка в одном сообщении.
-    Max 2 уведомления "сегодня", max 1 уведомление "завтра"."""
+    """Дневная проверка дедлайнов — 14:00 Красноярск (07:00 UTC).
+    Показывает ВСЕ активные задачи с deadline=сегодня + кнопки ✅/➡️.
+    Утренние дедлайны — в briefing (09:00), завтрашние — в evening review (21:00)."""
     try:
         today = date.today()
         tasks = await get_active_tasks()
 
-        today_tasks = []
-        tomorrow_tasks = []
+        today_tasks = [t for t in tasks if t.get("deadline") and t["deadline"].date() == today]
 
-        for t in tasks:
-            if not t.get("deadline"):
-                continue
-            task_id = t["id"]
-            days_left = (t["deadline"].date() - today).days
-
-            if days_left == 0:
-                sent = await get_deadline_notification_count(task_id, today)
-                if sent < 1:
-                    today_tasks.append(t)
-            elif days_left == 1:
-                tomorrow = today + timedelta(days=1)
-                sent = await get_deadline_notification_count(task_id, tomorrow)
-                if sent < 1:
-                    tomorrow_tasks.append(t)
-
-        if not today_tasks and not tomorrow_tasks:
+        if not today_tasks:
             return  # Нечего уведомлять
 
-        lines = []
-        if today_tasks:
-            lines.append("⏰ <b>Дедлайны СЕГОДНЯ:</b>")
-            for t in today_tasks:
-                lines.append(f"  • #{t['id']} {t['description']}")
-                await save_deadline_notification(t["id"], today)
+        lines = ["⏰ <b>Дедлайны СЕГОДНЯ:</b>"]
+        for t in today_tasks:
+            who_str = f" [{t['who']}]" if t.get("who") else ""
+            # Deep link
+            chat_id = t.get("chat_id") or 0
+            orig_msg_id = t.get("telegram_msg_id") or t.get("orig_tg_msg_id") or 0
+            link = build_message_link(chat_id, orig_msg_id)
+            link_html = f' <a href="{link}">📎</a>' if link else ""
+            lines.append(f"  • #{t['id']} {t['description']}{who_str}{link_html}")
 
-        if tomorrow_tasks:
-            lines.append("📅 <b>Дедлайны ЗАВТРА:</b>")
-            for t in tomorrow_tasks:
-                lines.append(f"  • #{t['id']} {t['description']}")
-                tomorrow = today + timedelta(days=1)
-                await save_deadline_notification(t["id"], tomorrow)
-
-        await notify_owner("\n".join(lines))
-        logger.info(f"Дедлайны: {len(today_tasks)} сегодня, {len(tomorrow_tasks)} завтра")
+        await notify_owner(
+            "\n".join(lines),
+            reply_markup_type="evening_review",
+            review_task_ids=[t["id"] for t in today_tasks[:10]],
+        )
+        logger.info(f"Дневные дедлайны: {len(today_tasks)} задач на сегодня")
     except Exception as e:
         logger.error(f"Ошибка проверки дедлайнов: {e}", exc_info=True)
 
@@ -358,7 +352,7 @@ async def weekly_analysis():
 async def cleanup_old_conversations():
     """Каждый час — очистка старой истории диалога."""
     try:
-        await cleanup_conversation_history(max_age_hours=4)
+        await cleanup_conversation_history(max_age_hours=24)
     except Exception as e:
         logger.error(f"Ошибка очистки conversation_history: {e}", exc_info=True)
 
@@ -389,8 +383,8 @@ async def start_scheduler():
     # v4: Мониторинг исходящих задач — раз в день 06:00 UTC = 13:00 Красноярск
     scheduler.add_job(check_tracked_tasks, CronTrigger(hour=6, minute=0))
 
-    # Проверка дедлайнов — каждый час
-    scheduler.add_job(check_deadlines, CronTrigger(minute=30))
+    # Дневная проверка дедлайнов — 07:00 UTC = 14:00 Красноярск
+    scheduler.add_job(check_deadlines, CronTrigger(hour=7, minute=0))
 
     # Еженедельный анализ — воскресенье 03:00 UTC = 10:00 Красноярск
     scheduler.add_job(weekly_analysis, CronTrigger(
