@@ -811,7 +811,6 @@ async def cb_skip_reason(callback: CallbackQuery):
     # Извлекаем pending feedback (если есть)
     fb = _awaiting_feedback.pop(user_id, None)
     if fb:
-        from src.db import save_classification_feedback
         try:
             await save_classification_feedback(
                 message_id=fb.get("msg_id", msg_id),

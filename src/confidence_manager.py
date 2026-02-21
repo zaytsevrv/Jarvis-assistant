@@ -96,8 +96,11 @@ async def _delayed_medium_notify(
         logger.warning(f"B3: ошибка проверки разрешения задачи: {e}")
 
     # Задача не разрешилась — отправляем уведомление
-    await notify_owner(notify_text, **notify_kwargs)
-    logger.info(f"B3: MEDIUM уведомление отправлено после задержки: {summary[:60]}")
+    try:
+        await notify_owner(notify_text, **notify_kwargs)
+        logger.info(f"B3: MEDIUM уведомление отправлено после задержки: {summary[:60]}")
+    except Exception as e:
+        logger.error(f"B3: ошибка отправки MEDIUM уведомления: {e}")
 
 
 # ─── Основная логика классификации ───────────────────────────

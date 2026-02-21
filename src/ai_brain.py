@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -710,8 +711,6 @@ class AIBrain:
     async def analyze_image(self, image_bytes: bytes) -> str:
         """B2: анализирует фото через Haiku Vision → краткое описание.
         Используется чтобы сохранить содержимое фото в БД вместо [photo]."""
-        import base64
-
         if not self._api_client:
             if not config.ANTHROPIC_API_KEY:
                 raise RuntimeError("Vision требует API-режим. ANTHROPIC_API_KEY не задан.")
@@ -796,7 +795,7 @@ class AIBrain:
 
         result = await self.ask(prompt, model="haiku")
         stripped = result.strip()
-        if stripped.upper() in ("НЕТ", "НЕТ.") or not stripped:
+        if not stripped or stripped.upper().startswith("НЕТ"):
             return ""
         return stripped
 
