@@ -19,7 +19,6 @@ from src.db import (
     get_messages_since,
     get_setting,
     set_setting,
-    has_similar_active_task,
     build_message_link,
 )
 
@@ -218,6 +217,29 @@ TOOL_DEFINITIONS = [
             "required": ["action"],
         },
     },
+    {
+        "name": "update_preferences",
+        "description": (
+            "Сохранить пользовательские настройки навсегда. "
+            "Используй когда пользователь просит изменить обращение (ты/вы), "
+            "включить/отключить эмодзи или изменить стиль общения."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "enum": ["address", "emoji", "style"],
+                    "description": "address — обращение (ты/вы), emoji — эмодзи (true/false), style — стиль (formal/casual/business-casual)."
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Новое значение. address: 'ты' или 'вы'. emoji: 'true' или 'false'. style: 'formal'/'casual'/'business-casual'."
+                },
+            },
+            "required": ["key", "value"],
+        },
+    },
 ]
 
 
@@ -307,12 +329,16 @@ async def _tool_create_task(params: dict) -> dict:
 
 
 async def _find_similar_task(description: str) -> Optional[dict]:
-    """Ищет похожую активную задачу, возвращает dict или None."""
+    """Ищет похожую активную задачу, возвращает dict или None.
+    Проверяет substring только если обе строки достаточно специфичны (>20 символов),
+    чтобы не блокировать создание задач по коротким общим словам ('позвонить').
+    """
     tasks = await get_active_tasks()
     desc_lower = description.lower().strip()[:70]
     for t in tasks:
         t_desc = t["description"].lower().strip()[:70]
-        if desc_lower in t_desc or t_desc in desc_lower:
+        shorter = min(len(desc_lower), len(t_desc))
+        if shorter >= 20 and (desc_lower in t_desc or t_desc in desc_lower):
             return t
     return None
 
@@ -393,7 +419,8 @@ async def _tool_update_task(params: dict) -> dict:
 
     if "new_deadline" in params and params["new_deadline"]:
         try:
-            dl = datetime.strptime(params["new_deadline"], "%Y-%m-%d")
+            TZ_OFFSET = timezone(timedelta(hours=7))
+            dl = datetime.strptime(params["new_deadline"], "%Y-%m-%d").replace(tzinfo=TZ_OFFSET)
             param_idx += 1
             updates.append(f"deadline = ${param_idx}")
             values.append(dl)
@@ -424,7 +451,7 @@ async def _tool_update_task(params: dict) -> dict:
 
 async def _tool_search_memory(params: dict) -> dict:
     query = params["query"]
-    limit = params.get("limit", 20)
+    limit = min(params.get("limit", 20), 100)
 
     results = await search_messages(query, limit=limit)
 
@@ -511,7 +538,6 @@ async def _tool_manage_whitelist(params: dict) -> dict:
 
 async def _tool_update_preferences(params: dict) -> dict:
     """Сохраняет пользовательские настройки в БД навсегда."""
-    import json as _json
     key = params.get("key")
     value = params.get("value")
 
@@ -531,12 +557,12 @@ async def _tool_update_preferences(params: dict) -> dict:
 
     raw = await get_setting("user_preferences", '{"address": "ты", "emoji": true, "style": "business-casual"}')
     try:
-        prefs = _json.loads(raw)
+        prefs = json.loads(raw)
     except Exception:
         prefs = {"address": "ты", "emoji": True, "style": "business-casual"}
 
     prefs[key] = value
-    await set_setting("user_preferences", _json.dumps(prefs, ensure_ascii=False))
+    await set_setting("user_preferences", json.dumps(prefs, ensure_ascii=False))
 
     labels = {"address": "обращение", "emoji": "эмодзи", "style": "стиль"}
     return {
