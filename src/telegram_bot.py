@@ -147,17 +147,11 @@ async def notify_callback(text: str, **kwargs):
     markup_type = kwargs.get("reply_markup_type")
     markup = None
 
-    if markup_type == "new_contact":
-        contact_id = kwargs.get("contact_id", 0)
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Мониторить", callback_data=f"contact_monitor:{contact_id}"),
-                InlineKeyboardButton(text="Только сохранять", callback_data=f"contact_save:{contact_id}"),
-                InlineKeyboardButton(text="Игнорировать", callback_data=f"contact_ignore:{contact_id}"),
-            ]
-        ])
+    # v6: new_contact кнопки отключены (никогда не вызывались, нет обработчиков).
+    # Заготовка для v7+: "новый контакт → мониторить/сохранять/игнорировать".
+    # См. DEVLOG.md v6 → "Отключённый код".
 
-    elif markup_type == "urgent_confidence":
+    if markup_type == "urgent_confidence":
         queue_id = kwargs.get("queue_id", 0)
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [
