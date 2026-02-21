@@ -515,9 +515,11 @@ async def get_active_tasks() -> list:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT * FROM tasks
-               WHERE status = 'active'
-               ORDER BY deadline ASC NULLS LAST, created_at DESC"""
+            """SELECT t.*, m.telegram_msg_id AS orig_tg_msg_id
+               FROM tasks t
+               LEFT JOIN messages m ON t.source_msg_id = m.id
+               WHERE t.status = 'active'
+               ORDER BY t.deadline ASC NULLS LAST, t.created_at DESC"""
         )
         return [dict(r) for r in rows]
 
@@ -638,7 +640,7 @@ async def update_task_last_checked(task_id: int):
 def build_message_link(chat_id: int, telegram_msg_id: int) -> str:
     """Строит deep link на сообщение в Telegram.
     Для supergroup/channel: https://t.me/c/{id}/{msg_id}
-    Для ЛС: пустая строка (нет прямой ссылки на сообщение)."""
+    Для ЛС: tg://user?id={chat_id} (открывает чат с человеком)."""
     if not chat_id or not telegram_msg_id:
         return ""
     chat_str = str(chat_id)
@@ -646,8 +648,10 @@ def build_message_link(chat_id: int, telegram_msg_id: int) -> str:
     if chat_str.startswith("-100"):
         normalized = chat_str[4:]
         return f"https://t.me/c/{normalized}/{telegram_msg_id}"
+    # ЛС: положительные ID → ссылка на чат с человеком
+    if chat_id > 0:
+        return f"tg://user?id={chat_id}"
     # Обычные группы: -XXXXXXXXX — ссылка не поддерживается
-    # ЛС: положительные ID — ссылка не поддерживается
     return ""
 
 

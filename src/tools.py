@@ -20,6 +20,7 @@ from src.db import (
     get_setting,
     set_setting,
     has_similar_active_task,
+    build_message_link,
 )
 
 logger = logging.getLogger("jarvis.tools")
@@ -341,6 +342,9 @@ async def _tool_list_tasks(params: dict) -> dict:
             item["remind_at"] = t["remind_at"].strftime("%H:%M %d.%m")
         if t.get("recurrence"):
             item["recurrence"] = t["recurrence"]
+        link = build_message_link(t.get("chat_id", 0), t.get("orig_tg_msg_id", 0))
+        if link:
+            item["link"] = link
         result.append(item)
 
     return {"status": "ok", "count": len(result), "tasks": result}
@@ -429,12 +433,16 @@ async def _tool_search_memory(params: dict) -> dict:
 
     messages = []
     for m in results[:limit]:
-        messages.append({
+        link = build_message_link(m.get("chat_id", 0), m.get("telegram_msg_id", 0))
+        msg = {
             "sender": m.get("sender_name", "?"),
             "chat": m.get("chat_title", "?"),
             "text": m.get("text", "")[:500],
             "date": m["timestamp"].strftime("%d.%m.%Y %H:%M") if m.get("timestamp") else "?",
-        })
+        }
+        if link:
+            msg["link"] = link
+        messages.append(msg)
 
     return {"status": "ok", "count": len(messages), "messages": messages}
 

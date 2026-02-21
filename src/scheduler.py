@@ -205,7 +205,7 @@ async def check_timed_reminders():
             orig_msg_id = t.get("telegram_msg_id") or t.get("orig_tg_msg_id") or 0
             link = build_message_link(chat_id, orig_msg_id)
             if link:
-                lines.append(f'<a href="{link}">📎 Перейти к сообщению</a>')
+                lines.append(f'<a href="{link}">📎</a>')
 
             await notify_owner(
                 "\n".join(lines),
