@@ -93,6 +93,16 @@ async def morning_briefing():
             if dm_summary:
                 await notify_owner(f"💬 ЛИЧНЫЕ СООБЩЕНИЯ:\n\n{dm_summary}")
 
+            # B4: кросс-референс ЛС с активными задачами
+            tasks_with_who = [t for t in tasks if t.get("who")]
+            if tasks_with_who:
+                try:
+                    cross_ref = await brain.generate_cross_reference(dm_data, tasks_with_who)
+                    if cross_ref:
+                        await notify_owner(f"🔗 <b>СВЯЗИ ЛС ↔ ЗАДАЧИ:</b>\n{cross_ref}")
+                except Exception as e:
+                    logger.error(f"B4 cross-reference error: {e}", exc_info=True)
+
         logger.info("Утренний брифинг отправлен")
     except Exception as e:
         logger.error(f"Ошибка утреннего брифинга: {e}", exc_info=True)
@@ -176,6 +186,16 @@ async def evening_digest():
             dm_summary = await brain.generate_dm_summary(dm_data)
             if dm_summary:
                 await notify_owner(f"💬 ЛС ЗА ДЕНЬ:\n\n{dm_summary}")
+
+            # B4: кросс-референс ЛС с активными задачами
+            tasks_with_who = [t for t in tasks if t.get("who")]
+            if tasks_with_who:
+                try:
+                    cross_ref = await brain.generate_cross_reference(dm_data, tasks_with_who)
+                    if cross_ref:
+                        await notify_owner(f"🔗 <b>СВЯЗИ ЛС ↔ ЗАДАЧИ:</b>\n{cross_ref}")
+                except Exception as e:
+                    logger.error(f"B4 cross-reference error: {e}", exc_info=True)
 
         logger.info("Вечерний дайджест отправлен")
     except Exception as e:

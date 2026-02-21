@@ -705,6 +705,101 @@ class AIBrain:
         )
         return response.content[0].text
 
+    # ─── B2: Vision для фото ────────────────────────────────
+
+    async def analyze_image(self, image_bytes: bytes) -> str:
+        """B2: анализирует фото через Haiku Vision → краткое описание.
+        Используется чтобы сохранить содержимое фото в БД вместо [photo]."""
+        import base64
+
+        if not self._api_client:
+            if not config.ANTHROPIC_API_KEY:
+                raise RuntimeError("Vision требует API-режим. ANTHROPIC_API_KEY не задан.")
+            self._api_client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+
+        image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+        # Определяем MIME-тип по magic bytes
+        if image_bytes[:3] == b"\xff\xd8\xff":
+            media_type = "image/jpeg"
+        elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            media_type = "image/png"
+        elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+            media_type = "image/webp"
+        else:
+            media_type = "image/jpeg"
+
+        model_id = self._resolve_model_api("haiku")
+        response = await self._api_client.messages.create(
+            model=model_id,
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": image_b64},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Опиши коротко (1-2 предложения) что изображено. "
+                            "Если документ/квитанция — укажи тип и ключевые данные (суммы, даты, названия). "
+                            "Если фото — что на нём. Отвечай по-русски, без предисловий."
+                        ),
+                    },
+                ],
+            }],
+            temperature=0.2,
+        )
+        self._last_api_cost = self._calc_cost(
+            model_id, response.usage.input_tokens, response.usage.output_tokens,
+        )
+        return response.content[0].text.strip()
+
+    # ─── B4: Кросс-референс ЛС с задачами ──────────────────
+
+    async def generate_cross_reference(self, dm_data: list, tasks: list) -> str:
+        """B4: ищет связи между тем кто писал сегодня и активными задачами.
+
+        dm_data: [{sender_name, msg_count, previews}, ...]
+        tasks: [{id, description, who, deadline}, ...]
+        Возвращает HTML-строку с найденными связями или пустую строку.
+        """
+        if not dm_data or not tasks:
+            return ""
+
+        task_lines = []
+        for t in tasks[:15]:
+            who = t.get("who") or "?"
+            deadline_str = ""
+            if t.get("deadline"):
+                deadline_str = f", дедлайн {t['deadline'].strftime('%d.%m')}"
+            task_lines.append(f"#{t['id']} [{who}] {t['description'][:80]}{deadline_str}")
+
+        dm_lines = []
+        for d in dm_data[:20]:
+            dm_lines.append(
+                f"- {d['sender_name']} ({d['msg_count']} сообщ.): {(d.get('previews') or '')[:100]}"
+            )
+
+        prompt = (
+            f"Найди связи между тем кто писал в ЛС сегодня и активными задачами.\n\n"
+            f"КТО ПИСАЛ СЕГОДНЯ:\n" + "\n".join(dm_lines) + "\n\n"
+            f"АКТИВНЫЕ ЗАДАЧИ (поле [кто]):\n" + "\n".join(task_lines) + "\n\n"
+            f"Если имя из ЛС совпадает (или похоже) с полем [кто] в задаче — это связь.\n"
+            f"Пиши только реальные совпадения. Формат:\n"
+            f"• Иванов писал → задача #3: оплатить счёт\n"
+            f"Если совпадений нет — ответь одним словом: НЕТ\n"
+            f"HTML-форматирование, без Markdown."
+        )
+
+        result = await self.ask(prompt, model="haiku")
+        stripped = result.strip()
+        if stripped.upper() in ("НЕТ", "НЕТ.") or not stripped:
+            return ""
+        return stripped
+
     # ─── Мониторинг исходящих задач (v4) ────────────────────
 
     async def check_task_completion(self, task: dict, chat_messages: list, chat_title: str) -> dict:

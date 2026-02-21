@@ -282,6 +282,19 @@ async def on_new_message(event, account_label: str = ""):
         if not text:
             return
 
+        # B2: Vision для фото в ЛС — описываем содержимое через Haiku
+        # Только личные чаты (там идёт классификация + task tracking)
+        if msg.photo and is_private and not msg.text:
+            try:
+                image_bytes = await event.client.download_media(msg, bytes)
+                if image_bytes and len(image_bytes) < 5 * 1024 * 1024:
+                    description = await brain.analyze_image(image_bytes)
+                    if description:
+                        text = f"[photo: {description}]"
+                        logger.debug(f"B2: фото Vision: {description[:80]}")
+            except Exception as e:
+                logger.warning(f"B2: ошибка Vision для фото: {e}")
+
         # Сохраняем в БД. None = дубликат
         db_msg_id = await save_message(
             telegram_msg_id=msg.id,
