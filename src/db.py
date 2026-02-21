@@ -592,6 +592,22 @@ async def get_recent_chat_messages(chat_id: int, since: datetime, limit: int = 3
         return [dict(r) for r in rows]
 
 
+async def get_tracked_tasks_for_chat(chat_id: int) -> list:
+    """v6: Active tracked tasks для конкретного чата (event-driven проверка ответов)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT t.*, m.telegram_msg_id as orig_tg_msg_id
+               FROM tasks t
+               LEFT JOIN messages m ON t.source_msg_id = m.id
+               WHERE t.track_completion = TRUE
+                 AND t.status = 'active'
+                 AND t.chat_id = $1""",
+            chat_id,
+        )
+        return [dict(r) for r in rows]
+
+
 async def get_tracked_tasks_to_check() -> list:
     """Возвращает задачи для проверки выполнения.
     v4: track_completion=TRUE, active, и пора проверять (last_checked_at + interval)."""
@@ -753,7 +769,9 @@ async def get_pending_confidence(limit: int = 10) -> list:
         return [dict(r) for r in rows]
 
 
-async def resolve_confidence(queue_id: int, actual_type: str):
+async def resolve_confidence(queue_id: int, actual_type: str,
+                             predicted_confidence: int = None, user_reason: str = None):
+    """Разрешает элемент confidence-очереди + сохраняет feedback."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -761,16 +779,49 @@ async def resolve_confidence(queue_id: int, actual_type: str):
             queue_id
         )
         row = await conn.fetchrow(
-            "SELECT message_id, predicted_type FROM confidence_queue WHERE id = $1",
+            "SELECT message_id, predicted_type, confidence FROM confidence_queue WHERE id = $1",
             queue_id
         )
         if row:
+            conf = predicted_confidence if predicted_confidence is not None else row.get("confidence")
             await conn.execute(
                 """INSERT INTO classification_feedback
-                   (message_id, predicted_type, actual_type)
-                   VALUES ($1, $2, $3)""",
-                row["message_id"], row["predicted_type"], actual_type,
+                   (message_id, predicted_type, actual_type, predicted_confidence, user_reason)
+                   VALUES ($1, $2, $3, $4, $5)""",
+                row["message_id"], row["predicted_type"], actual_type, conf, user_reason,
             )
+
+
+async def save_classification_feedback(
+    message_id: int, predicted_type: str, actual_type: str,
+    predicted_confidence: int = None, user_reason: str = None,
+):
+    """v6: Прямая запись feedback (для classify-кнопок, минуя confidence_queue)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO classification_feedback
+               (message_id, predicted_type, actual_type, predicted_confidence, user_reason)
+               VALUES ($1, $2, $3, $4, $5)""",
+            message_id, predicted_type, actual_type, predicted_confidence, user_reason,
+        )
+
+
+async def get_recent_feedback(limit: int = 10) -> list:
+    """v6: Последние feedback-записи с текстом сообщения для few-shot инжекции."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT cf.predicted_type, cf.actual_type, cf.user_reason,
+                      m.text, m.sender_name
+               FROM classification_feedback cf
+               JOIN messages m ON cf.message_id = m.id
+               WHERE cf.actual_type IS NOT NULL
+               ORDER BY cf.created_at DESC
+               LIMIT $1""",
+            limit,
+        )
+        return [dict(r) for r in rows]
 
 
 # ─── Дневные сводки ──────────────────────────────────────────

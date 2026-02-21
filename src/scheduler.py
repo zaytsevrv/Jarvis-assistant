@@ -218,65 +218,74 @@ async def check_timed_reminders():
         logger.error(f"Ошибка check_timed_reminders: {e}", exc_info=True)
 
 
+async def check_tracked_task_single(task: dict):
+    """v6: Проверка одной tracked-задачи. Вызывается из scheduler и listener (event-driven)."""
+    task_id = task["id"]
+    chat_id = task.get("chat_id")
+    if not chat_id:
+        await update_task_last_checked(task_id)
+        return
+
+    # Загружаем сообщения из чата за check_interval_days
+    interval = task.get("check_interval_days") or 3
+    since = datetime.now(timezone.utc) - timedelta(days=interval)
+    chat_msgs = await get_recent_chat_messages(chat_id, since, limit=30)
+
+    chat_title = task.get("source", "").replace("telegram:", "") or f"чат {chat_id}"
+    result = await brain.check_task_completion(task, chat_msgs, chat_title)
+    status = result["status"]
+    evidence = result.get("evidence", "")
+
+    assignee = task.get("sender_name") or task.get("who") or "?"
+    desc = task["description"]
+
+    # Deep link
+    link = build_message_link(chat_id, task.get("telegram_msg_id") or task.get("orig_tg_msg_id") or 0)
+    link_html = f' <a href="{link}">📎</a>' if link else ""
+
+    if status == "completed":
+        await notify_owner(
+            f"✅ Задача #{task_id} для {assignee}: {desc}{link_html}\n"
+            f"Похоже, выполнена: {evidence}",
+            reply_markup_type="track_completed",
+            task_id=task_id,
+        )
+    elif status == "not_completed":
+        await notify_owner(
+            f"⏳ Задача #{task_id} для {assignee}: {desc}{link_html}\n"
+            f"Ответа нет.",
+            reply_markup_type="track_pending",
+            task_id=task_id,
+        )
+    else:  # unclear
+        await notify_owner(
+            f"❓ Задача #{task_id} для {assignee}: {desc}{link_html}\n"
+            f"Есть активность, но непонятно: {evidence}",
+            reply_markup_type="track_pending",
+            task_id=task_id,
+        )
+
+    await update_task_last_checked(task_id)
+
+
 async def check_tracked_tasks():
-    """v4: Проверка исходящих задач (track_completion=TRUE).
-    Раз в день, 06:00 UTC = 13:00 Красноярск.
-    AI анализирует чат и определяет, выполнена ли задача."""
+    """v6: Проверка исходящих задач (track_completion=TRUE).
+    4×/день: 09:00, 13:00, 17:00, 21:00 Красноярск."""
     try:
         tasks = await get_tracked_tasks_to_check()
         if not tasks:
             logger.info("Мониторинг задач: нечего проверять")
             return
 
+        checked = 0
         for task in tasks:
-            task_id = task["id"]
-            chat_id = task.get("chat_id")
-            if not chat_id:
-                await update_task_last_checked(task_id)
-                continue
+            try:
+                await check_tracked_task_single(task)
+                checked += 1
+            except Exception as e:
+                logger.error(f"Ошибка проверки задачи #{task.get('id')}: {e}", exc_info=True)
 
-            # Загружаем сообщения из чата за check_interval_days
-            interval = task.get("check_interval_days") or 3
-            since = datetime.now(timezone.utc) - timedelta(days=interval)
-            chat_msgs = await get_recent_chat_messages(chat_id, since, limit=30)
-
-            chat_title = task.get("source", "").replace("telegram:", "") or f"чат {chat_id}"
-            result = await brain.check_task_completion(task, chat_msgs, chat_title)
-            status = result["status"]
-            evidence = result.get("evidence", "")
-
-            assignee = task.get("sender_name") or task.get("who") or "?"
-            desc = task["description"]
-
-            # Deep link
-            link = build_message_link(chat_id, task.get("telegram_msg_id") or task.get("orig_tg_msg_id") or 0)
-            link_html = f' <a href="{link}">📎</a>' if link else ""
-
-            if status == "completed":
-                await notify_owner(
-                    f"✅ Задача #{task_id} для {assignee}: {desc}{link_html}\n"
-                    f"Похоже, выполнена: {evidence}",
-                    reply_markup_type="track_completed",
-                    task_id=task_id,
-                )
-            elif status == "not_completed":
-                await notify_owner(
-                    f"⏳ Задача #{task_id} для {assignee}: {desc}{link_html}\n"
-                    f"Ответа нет.",
-                    reply_markup_type="track_pending",
-                    task_id=task_id,
-                )
-            else:  # unclear
-                await notify_owner(
-                    f"❓ Задача #{task_id} для {assignee}: {desc}{link_html}\n"
-                    f"Есть активность, но непонятно: {evidence}",
-                    reply_markup_type="track_pending",
-                    task_id=task_id,
-                )
-
-            await update_task_last_checked(task_id)
-
-        logger.info(f"Мониторинг задач: проверено {len(tasks)}")
+        logger.info(f"Мониторинг задач: проверено {checked}/{len(tasks)}")
     except Exception as e:
         logger.error(f"Ошибка check_tracked_tasks: {e}", exc_info=True)
 
@@ -380,8 +389,9 @@ async def start_scheduler():
     # K1: Проверка time-based напоминаний — каждую минуту
     scheduler.add_job(check_timed_reminders, CronTrigger(minute="*"))
 
-    # v4: Мониторинг исходящих задач — раз в день 06:00 UTC = 13:00 Красноярск
-    scheduler.add_job(check_tracked_tasks, CronTrigger(hour=6, minute=0))
+    # v6: Мониторинг исходящих задач — 4×/день (09:05, 13:05, 17:05, 21:05 Красноярск)
+    # minute=5 чтобы не пересекаться с briefing (02:00) и digest (14:00)
+    scheduler.add_job(check_tracked_tasks, CronTrigger(hour='2,6,10,14', minute=5))
 
     # Дневная проверка дедлайнов — 07:00 UTC = 14:00 Красноярск
     scheduler.add_job(check_deadlines, CronTrigger(hour=7, minute=0))

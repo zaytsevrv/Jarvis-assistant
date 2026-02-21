@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 
 from src import config
 from src.db import (
@@ -12,6 +12,22 @@ from src.db import (
     get_messages_around,
 )
 from src.ai_brain import brain
+
+
+# v6: Метки типов для прозрачных уведомлений
+_TYPE_LABELS = {
+    "task_from_me": "Задача от вас",
+    "task_for_me": "Задача для вас",
+    "promise_mine": "Ваше обещание",
+    "promise_incoming": "Чужое обещание",
+    "info": "Информация",
+    "question": "Вопрос",
+    "spam": "Спам/мусор",
+}
+
+
+def _type_label(t: str) -> str:
+    return _TYPE_LABELS.get(t, t)
 
 logger = logging.getLogger("jarvis.confidence")
 
@@ -54,7 +70,7 @@ async def process_classification(
     account_label: str = "",
 ):
     """Классификация сообщения AI и обработка по уровню confidence.
-    v4: контекстное окно + направление + sender_id."""
+    v6: прозрачность для ВСЕХ 3 зон + original_type + авто-remind + feedback."""
     try:
         # v4: загружаем контекстное окно (±2 сообщения из того же чата)
         context_messages = await get_messages_around(db_msg_id, chat_id, window=2)
@@ -76,29 +92,49 @@ async def process_classification(
         is_urgent = result.get("is_urgent", False)
         assignee = result.get("assignee")  # v4: кому назначена задача
 
-        # Парсинг дедлайна
+        # Парсинг дедлайна (всегда UTC-aware для PostgreSQL TIMESTAMPTZ)
         deadline = None
         if deadline_str:
             try:
                 deadline = datetime.fromisoformat(deadline_str)
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 pass
 
-        # v4: определяем нужно ли отслеживать (task_from_me = исходящая задача)
-        track = msg_type == "task_from_me"
-        # Нормализуем тип для БД (task_from_me/task_for_me → task в таблице)
-        if msg_type in ("task_from_me", "task_for_me"):
-            msg_type = "task"
+        # v6: сохраняем original_type ДО нормализации (для уведомлений и feedback)
+        original_type = msg_type
 
-        # Три зоны confidence
+        # v6: track_completion для исходящих задач И чужих обещаний
+        track = original_type in ("task_from_me", "promise_incoming")
+
+        # v6: авто-remind_at для входящих задач и своих обещаний
+        remind_at = None
+        if original_type in ("task_for_me", "promise_mine"):
+            if deadline:
+                remind_at = deadline - timedelta(hours=2)
+            else:
+                remind_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+        # Нормализуем тип для БД (DB constraint: task, promise_mine, promise_incoming)
+        db_type = msg_type
+        if db_type in ("task_from_me", "task_for_me", "question"):
+            db_type = "task"
+
+        # Deep link: telegram_msg_id не передаётся в process_classification,
+        # поэтому пока без ссылки. Track tasks используют source_msg_id → messages.telegram_msg_id.
+        link_html = ""
+
+        # v6: Три зоны confidence — ВСЕ прозрачны для владельца
         if confidence > config.CONFIDENCE_HIGH:
-            # >90% — молча создаёт задачу
-            if msg_type in ("task", "promise_mine", "promise_incoming"):
+            # >90% — создаёт задачу + уведомляет
+            if db_type in ("task", "promise_mine", "promise_incoming"):
                 task_id = await create_task(
-                    task_type=msg_type,
+                    task_type=db_type,
                     description=summary,
                     who=who or assignee,
                     deadline=deadline,
+                    remind_at=remind_at,
                     confidence=confidence,
                     source=f"telegram:{chat_title}",
                     source_msg_id=db_msg_id,
@@ -110,29 +146,64 @@ async def process_classification(
                 )
                 logger.info(f"Задача #{task_id} создана (confidence {confidence}%): {summary}")
 
-        elif confidence >= config.CONFIDENCE_LOW:
-            # 50-80% — в очередь confidence
-            if msg_type in ("task", "promise_mine", "promise_incoming", "question"):
-                # Проверяем: срочное?
-                if is_urgent:
-                    await _handle_urgent(
-                        db_msg_id, chat_id, sender_name, text, msg_type, confidence
-                    )
-                else:
-                    await add_to_confidence_queue(
-                        message_id=db_msg_id,
-                        chat_id=chat_id,
-                        sender_name=sender_name,
-                        text_preview=text[:150],
-                        predicted_type=msg_type,
-                        confidence=confidence,
-                        is_urgent=False,
-                    )
-                    logger.info(f"В confidence-очередь (confidence {confidence}%): {summary}")
+                # v6: Прозрачное уведомление (HIGH)
+                await notify_owner(
+                    f"🔔 <b>Авто-задача #{task_id}</b> ({confidence}%)\n"
+                    f"📝 {summary}\n"
+                    f"👤 {sender_name} → {who or assignee or '?'}\n"
+                    f"🗂 {_type_label(original_type)}{link_html}",
+                    reply_markup_type="classify_high",
+                    task_id=task_id,
+                    message_id=db_msg_id,
+                    extra={"original_type": original_type, "confidence": confidence,
+                           "task_id": task_id, "zone": "high",
+                           "summary": summary, "who": who or assignee,
+                           "sender_id": sender_id, "sender_name": sender_name,
+                           "chat_id": chat_id, "chat_title": chat_title,
+                           "account": account_label, "db_type": db_type},
+                )
+            else:
+                # HIGH но info/question/spam — просто лог
+                logger.info(f"Классификация HIGH {original_type} ({confidence}%): {summary}")
 
-        # <50% — молча сохраняет как info, ничего не делает
+        elif confidence >= config.CONFIDENCE_LOW:
+            # 50-90% — НЕ создаёт задачу, спрашивает владельца
+            if db_type in ("task", "promise_mine", "promise_incoming", "question"):
+                await notify_owner(
+                    f"❓ <b>Похоже на задачу</b> ({confidence}%)\n"
+                    f"📝 {summary}\n"
+                    f"👤 {sender_name}\n"
+                    f"🗂 {_type_label(original_type)}{link_html}",
+                    reply_markup_type="classify_medium",
+                    message_id=db_msg_id,
+                    extra={"original_type": original_type, "confidence": confidence,
+                           "summary": summary, "who": who or assignee,
+                           "deadline_str": deadline_str,
+                           "sender_id": sender_id, "sender_name": sender_name,
+                           "chat_id": chat_id, "chat_title": chat_title,
+                           "account": account_label, "track": track,
+                           "remind_at_iso": remind_at.isoformat() if remind_at else None,
+                           "db_type": db_type, "zone": "medium"},
+                )
+                logger.info(f"Classify MEDIUM → владелец ({confidence}%): {summary}")
+            else:
+                logger.debug(f"Классификация MEDIUM {original_type} ({confidence}%): {summary}")
+
+        # <50% — уведомляет информационно
         else:
-            logger.debug(f"Пропущено (confidence {confidence}%): {summary}")
+            await notify_owner(
+                f"ℹ️ <b>{_type_label(original_type)}</b> ({confidence}%)\n"
+                f"📝 {summary}\n"
+                f"👤 {sender_name}{link_html}",
+                reply_markup_type="classify_low",
+                message_id=db_msg_id,
+                extra={"original_type": original_type, "confidence": confidence,
+                       "summary": summary, "sender_name": sender_name,
+                       "sender_id": sender_id, "chat_id": chat_id,
+                       "chat_title": chat_title, "account": account_label,
+                       "zone": "low"},
+            )
+            logger.debug(f"Classify LOW ({confidence}%): {summary}")
 
     except Exception as e:
         logger.error(f"Ошибка классификации: {e}", exc_info=True)

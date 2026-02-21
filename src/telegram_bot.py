@@ -23,6 +23,7 @@ from aiogram.types import (
 from src import config
 from src.db import (
     build_context,
+    create_task,
     get_active_tasks,
     get_db_stats,
     get_dm_summary_data,
@@ -31,6 +32,7 @@ from src.db import (
     get_setting,
     save_conversation_message,
     get_conversation_history,
+    save_classification_feedback,
     search_messages,
     set_setting,
     complete_task,
@@ -53,6 +55,14 @@ bot: Bot = None
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+# v6: Хранилище extra-данных для classify-кнопок (msg_id → extra)
+_classify_extra: dict[int, dict] = {}
+_CLASSIFY_EXTRA_MAX_AGE = 3600  # 1 час
+
+# v6: Ожидание текстовой причины feedback (user_id → {msg_id, original_type, confidence, ts})
+_awaiting_feedback: dict[int, dict] = {}
+_FEEDBACK_TIMEOUT = 300  # 5 минут
 
 
 # ─── Утилиты ─────────────────────────────────────────────────
@@ -210,7 +220,74 @@ async def notify_callback(text: str, **kwargs):
         if buttons:
             markup = InlineKeyboardMarkup(inline_keyboard=buttons)
 
+    elif markup_type == "classify_high":
+        # v6: задача уже создана — подтвердить или отменить
+        msg_id = kwargs.get("message_id", 0)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Верно", callback_data=f"clf_ok:{msg_id}"),
+                InlineKeyboardButton(text="❌ Ошибка", callback_data=f"clf_no:{msg_id}"),
+            ]
+        ])
+        extra = kwargs.get("extra")
+        if extra and msg_id:
+            extra["markup_type"] = "classify_high"
+            _store_classify_extra(msg_id, extra)
+
+    elif markup_type == "classify_medium":
+        # v6: задача НЕ создана — создать или отклонить
+        msg_id = kwargs.get("message_id", 0)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, создать", callback_data=f"clf_ok:{msg_id}"),
+                InlineKeyboardButton(text="❌ Нет", callback_data=f"clf_no:{msg_id}"),
+            ]
+        ])
+        extra = kwargs.get("extra")
+        if extra and msg_id:
+            extra["markup_type"] = "classify_medium"
+            _store_classify_extra(msg_id, extra)
+
+    elif markup_type == "classify_low":
+        # v6: информационно — подтвердить или сказать что это задача
+        msg_id = kwargs.get("message_id", 0)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Верно", callback_data=f"clf_ok:{msg_id}"),
+                InlineKeyboardButton(text="📝 Это задача", callback_data=f"clf_task:{msg_id}"),
+            ]
+        ])
+        extra = kwargs.get("extra")
+        if extra and msg_id:
+            extra["markup_type"] = "classify_low"
+            _store_classify_extra(msg_id, extra)
+
     await send_to_owner(text, reply_markup=markup)
+
+
+def _store_classify_extra(msg_id: int, extra: dict):
+    """Сохраняет extra-данные с timestamp + cleanup устаревших (>1ч)."""
+    import time as _time
+    now = _time.time()
+    extra["_ts"] = now
+    _classify_extra[msg_id] = extra
+    # Cleanup
+    stale = [k for k, v in _classify_extra.items()
+             if now - v.get("_ts", 0) > _CLASSIFY_EXTRA_MAX_AGE]
+    for k in stale:
+        del _classify_extra[k]
+
+
+def _store_awaiting_feedback(user_id: int, data: dict):
+    """Сохраняет feedback-данные + cleanup устаревших (>5 мин)."""
+    now = datetime.now(timezone.utc).timestamp()
+    data["ts"] = now
+    _awaiting_feedback[user_id] = data
+    # Cleanup всех устаревших записей
+    stale = [uid for uid, fb in _awaiting_feedback.items()
+             if now - fb.get("ts", 0) > _FEEDBACK_TIMEOUT * 2]
+    for uid in stale:
+        del _awaiting_feedback[uid]
 
 
 # ─── Постоянная клавиатура ───────────────────────────────────
@@ -540,6 +617,157 @@ async def cb_review_tomorrow(callback: CallbackQuery):
     task_id = int(callback.data.split(":")[1])
     await postpone_task_deadline(task_id, days=1)
     await callback.answer(f"➡️ #{task_id} перенесена на завтра")
+
+
+# ─── v6: Classify feedback callbacks ──────────────────────────
+
+@router.callback_query(F.data.startswith("clf_ok:"))
+async def cb_clf_ok(callback: CallbackQuery):
+    """v6: Классификация верна (✅)."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    msg_id = int(callback.data.split(":")[1])
+    extra = _classify_extra.pop(msg_id, {})
+    if not extra:
+        await callback.answer("⏳ Данные устарели (рестарт/таймаут)")
+        return
+    zone = extra.get("zone", "")
+    original_type = extra.get("original_type", "info")
+    confidence = extra.get("confidence", 0)
+
+    if zone == "medium":
+        # MEDIUM: пользователь подтвердил → создать задачу
+        db_type = extra.get("db_type", "task")
+        remind_at = None
+        if extra.get("remind_at_iso"):
+            try:
+                remind_at = datetime.fromisoformat(extra["remind_at_iso"])
+            except (ValueError, TypeError):
+                pass
+        deadline = None
+        if extra.get("deadline_str"):
+            try:
+                deadline = datetime.fromisoformat(extra["deadline_str"])
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                pass
+        task_id = await create_task(
+            task_type=db_type,
+            description=extra.get("summary", "Задача из ЛС"),
+            who=extra.get("who"),
+            deadline=deadline,
+            remind_at=remind_at,
+            confidence=100,
+            source=f"telegram:{extra.get('chat_title', '?')}",
+            source_msg_id=msg_id,
+            chat_id=extra.get("chat_id"),
+            sender_id=extra.get("sender_id"),
+            sender_name=extra.get("sender_name"),
+            account=extra.get("account"),
+            track_completion=extra.get("track", False),
+        )
+        if task_id:
+            await callback.answer(f"✅ Задача #{task_id} создана")
+        else:
+            await callback.answer("⚠️ Дубликат — задача не создана")
+    elif zone == "high":
+        await callback.answer("✅ Подтверждено")
+    else:  # low
+        await callback.answer("✅ Верно, не задача")
+
+    # НЕ сохраняем feedback сразу — ждём причину. Записываем данные в awaiting.
+    _store_awaiting_feedback(callback.from_user.id, {
+        "msg_id": msg_id, "original_type": original_type,
+        "actual_type": original_type,  # confirmed = predicted type was correct
+        "confidence": confidence,
+    })
+    await send_to_owner("Почему? (или /skip)")
+
+
+@router.callback_query(F.data.startswith("clf_no:"))
+async def cb_clf_no(callback: CallbackQuery):
+    """v6: Классификация неверна (❌)."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    msg_id = int(callback.data.split(":")[1])
+    extra = _classify_extra.pop(msg_id, {})
+    if not extra:
+        await callback.answer("⏳ Данные устарели (рестарт/таймаут)")
+        return
+    zone = extra.get("zone", "")
+    original_type = extra.get("original_type", "info")
+    confidence = extra.get("confidence", 0)
+
+    if zone == "high":
+        # HIGH: отменяем авто-созданную задачу
+        task_id = extra.get("task_id")
+        if task_id:
+            await cancel_task(task_id)
+            await callback.answer(f"❌ Задача #{task_id} отменена")
+        else:
+            await callback.answer("❌ Ошибка: task_id не найден")
+    elif zone == "medium":
+        await callback.answer("❌ Не создана")
+    else:
+        await callback.answer("❌ Отмечено")
+
+    # НЕ сохраняем feedback сразу — ждём причину
+    _store_awaiting_feedback(callback.from_user.id, {
+        "msg_id": msg_id, "original_type": original_type,
+        "actual_type": "not_task",  # rejected = AI was wrong
+        "confidence": confidence,
+    })
+    await send_to_owner("Почему ошибка? (или /skip)")
+
+
+@router.callback_query(F.data.startswith("clf_task:"))
+async def cb_clf_task(callback: CallbackQuery):
+    """v6: LOW был задачей — создать (📝 Это задача)."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    msg_id = int(callback.data.split(":")[1])
+    extra = _classify_extra.pop(msg_id, {})
+    if not extra:
+        await callback.answer("⏳ Данные устарели (рестарт/таймаут)")
+        return
+    original_type = extra.get("original_type", "info")
+    confidence = extra.get("confidence", 0)
+
+    # Создаём задачу из сообщения (с who/deadline если есть в extra)
+    deadline = None
+    if extra.get("deadline_str"):
+        try:
+            deadline = datetime.fromisoformat(extra["deadline_str"])
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+    task_id = await create_task(
+        task_type="task",
+        description=extra.get("summary", "Задача из ЛС"),
+        who=extra.get("who"),
+        deadline=deadline,
+        confidence=100,
+        source=f"telegram:{extra.get('chat_title', '?')}",
+        source_msg_id=msg_id,
+        chat_id=extra.get("chat_id"),
+        sender_id=extra.get("sender_id"),
+        sender_name=extra.get("sender_name"),
+        account=extra.get("account"),
+    )
+    if task_id:
+        await callback.answer(f"📝 Задача #{task_id} создана")
+    else:
+        await callback.answer("⚠️ Дубликат — задача не создана")
+
+    # НЕ сохраняем feedback сразу — ждём причину
+    _store_awaiting_feedback(callback.from_user.id, {
+        "msg_id": msg_id, "original_type": original_type,
+        "actual_type": "task",  # corrected: LOW was actually a task
+        "confidence": confidence,
+    })
+    await send_to_owner("Почему AI ошибся? (или /skip)")
 
 
 @router.callback_query(F.data.startswith("admin:"))
@@ -1174,6 +1402,40 @@ async def handle_photo(message: Message):
 async def handle_free_text(message: Message):
     """Основной обработчик свободного текста — диалог с tool_use."""
     text = message.text.strip()
+
+    # v6: Перехват текста для feedback (если ждём причину после ✅/❌)
+    user_id = message.from_user.id
+    if user_id in _awaiting_feedback:
+        fb = _awaiting_feedback.pop(user_id)
+        # Timeout: если прошло >5 мин — сохраняем без причины, не перехватываем текст
+        elapsed = datetime.now(timezone.utc).timestamp() - fb.get("ts", 0)
+        if elapsed > _FEEDBACK_TIMEOUT:
+            # Expired — сохраняем feedback без причины и обрабатываем текст нормально
+            try:
+                await save_classification_feedback(
+                    message_id=fb["msg_id"],
+                    predicted_type=fb["original_type"],
+                    actual_type=fb.get("actual_type", fb["original_type"]),
+                    predicted_confidence=fb["confidence"],
+                )
+            except Exception as e:
+                logger.warning(f"Feedback save (expired): {e}")
+            # НЕ возвращаем — текст пойдёт дальше как обычное сообщение
+        else:
+            text_lower_fb = text.strip().lower()
+            reason = None if text_lower_fb == "/skip" else text.strip()
+            try:
+                await save_classification_feedback(
+                    message_id=fb["msg_id"],
+                    predicted_type=fb["original_type"],
+                    actual_type=fb.get("actual_type", fb["original_type"]),
+                    predicted_confidence=fb["confidence"],
+                    user_reason=reason,
+                )
+            except Exception as e:
+                logger.warning(f"Feedback save error: {e}")
+            await send_to_owner("👍 Принято" if reason else "⏭ Пропущено")
+            return
 
     # Текстовые команды переключения режима
     text_lower = text.lower()

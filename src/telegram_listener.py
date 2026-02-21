@@ -23,6 +23,7 @@ from src.db import (
     get_or_create_contact,
     save_message,
     mark_message_processed,
+    get_tracked_tasks_for_chat,
 )
 from src.ai_brain import brain
 
@@ -324,11 +325,20 @@ async def on_new_message(event, account_label: str = ""):
             await mark_message_processed(db_msg_id)
             return
 
-        # v5: Классификация ОТКЛЮЧЕНА для whitelist-групп — задач там не бывает,
-        # сообщения сохраняются только для дайджеста (morning/evening summary).
-        # ЛС сохраняются для search_memory. Задачи создаются только по явной просьбе через бот-чат.
-
-        await mark_message_processed(db_msg_id)
+        # v6: Классификация ЛС — AI анализирует сообщения и создаёт задачи
+        # Whitelist-группы — БЕЗ классификации (только дайджест)
+        # Классифицируем И входящие, И исходящие — classify_message разбирает direction
+        # через owner_is_sender. Но tracked tasks проверяем ТОЛЬКО для входящих (не-владелец).
+        if is_private and not is_bot_chat and len(text) > 5:
+            await _classify_and_mark(
+                db_msg_id, text, sender_name, chat_title, chat_id,
+                sender_id=sender_id, account_label=account_label,
+            )
+            # v6: Event-driven проверка tracked tasks (если sender НЕ владелец)
+            if not config.is_owner(sender_id):
+                await _check_response_to_tracked(chat_id)
+        else:
+            await mark_message_processed(db_msg_id)
 
     except Exception as e:
         logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
@@ -383,6 +393,31 @@ def _get_media_type(msg) -> str | None:
     if msg.audio:
         return "audio"
     return None
+
+
+# v6: Debounce для event-driven проверки tracked tasks
+_last_track_check: dict[int, float] = {}  # {chat_id: monotonic_time}
+_TRACK_CHECK_DEBOUNCE = 60  # секунд
+
+
+async def _check_response_to_tracked(chat_id: int):
+    """v6: Проверяет tracked tasks если в чате пришёл новый ответ. Debounce 60с."""
+    now = time.monotonic()
+    last = _last_track_check.get(chat_id, 0)
+    if now - last < _TRACK_CHECK_DEBOUNCE:
+        return
+    _last_track_check[chat_id] = now
+
+    tracked = await get_tracked_tasks_for_chat(chat_id)
+    if not tracked:
+        return
+
+    from src.scheduler import check_tracked_task_single
+    for task in tracked:
+        try:
+            await check_tracked_task_single(task)
+        except Exception as e:
+            logger.error(f"Event-driven check error task #{task['id']}: {e}", exc_info=True)
 
 
 async def _classify_and_mark(db_msg_id, text, sender_name, chat_title, chat_id,

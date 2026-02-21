@@ -228,6 +228,23 @@ class AIBrain:
 
 Только JSON, без объяснений."""
 
+        # v6: few-shot инжекция из feedback
+        try:
+            from src.db import get_recent_feedback
+            feedback_examples = await get_recent_feedback(10)
+            if feedback_examples:
+                examples_block = "\n\nПРИМЕРЫ КЛАССИФИКАЦИИ (из обратной связи владельца):\n"
+                for ex in feedback_examples:
+                    reason = f" — {ex['user_reason']}" if ex.get("user_reason") else ""
+                    examples_block += (
+                        f"- \"{(ex.get('text') or '')[:80]}\" "
+                        f"[{ex.get('sender_name', '?')}] "
+                        f"→ {ex['actual_type']}{reason}\n"
+                    )
+                system_prompt += examples_block
+        except Exception as e:
+            logger.warning(f"Few-shot feedback load error: {e}")
+
         # v4: собираем контекстное окно
         context_block = ""
         if context_messages:
