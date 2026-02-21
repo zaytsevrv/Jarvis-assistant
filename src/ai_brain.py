@@ -508,8 +508,18 @@ class AIBrain:
         ]
 
         # Динамическая часть — меняется каждый запрос
+        # Мини-календарь: Python точно знает какой день недели, AI не должен угадывать
+        _days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        _today = now.date()
+        _cal = []
+        for i in range(7):
+            d = _today + timedelta(days=i)
+            label = "Сегодня" if i == 0 else "Завтра" if i == 1 else _days_ru[d.weekday()]
+            _cal.append(f"{label} {d.strftime('%d.%m')} ({_days_ru[d.weekday()]})")
+        calendar_line = " | ".join(_cal)
+
         dynamic = (
-            f"\nСегодня: {now.strftime('%d.%m.%Y')}. "
+            f"\n📅 {calendar_line}\n"
             f"Время: {now.strftime('%H:%M')} ({config.USER_TIMEZONE_NAME}, UTC+{config.USER_TIMEZONE_OFFSET}).\n"
             f"Расписание: утренний брифинг 09:00, вечерний дайджест 21:00 ({config.USER_TIMEZONE_NAME}).\n"
         )

@@ -121,9 +121,12 @@ async def process_classification(
         if db_type in ("task_from_me", "task_for_me", "question"):
             db_type = "task"
 
-        # Deep link: telegram_msg_id не передаётся в process_classification,
-        # поэтому пока без ссылки. Track tasks используют source_msg_id → messages.telegram_msg_id.
-        link_html = ""
+        # Deep link: для ЛС chat_id = user_id → tg://user открывает чат
+        # Для групп нужен telegram_msg_id (не передаётся), оставляем пустым
+        if chat_id and chat_id > 0:
+            link_html = f' <a href="tg://user?id={chat_id}">📎</a>'
+        else:
+            link_html = ""
 
         # v6: Три зоны confidence — ВСЕ прозрачны для владельца
         if confidence > config.CONFIDENCE_HIGH:
@@ -151,7 +154,8 @@ async def process_classification(
                     f"🔔 <b>Авто-задача #{task_id}</b> ({confidence}%)\n"
                     f"📝 {summary}\n"
                     f"👤 {sender_name} → {who or assignee or '?'}\n"
-                    f"🗂 {_type_label(original_type)}{link_html}",
+                    f"🗂 {_type_label(original_type)}\n"
+                    f"📱 {account_label}{link_html}",
                     reply_markup_type="classify_high",
                     task_id=task_id,
                     message_id=db_msg_id,
@@ -173,7 +177,8 @@ async def process_classification(
                     f"❓ <b>Похоже на задачу</b> ({confidence}%)\n"
                     f"📝 {summary}\n"
                     f"👤 {sender_name}\n"
-                    f"🗂 {_type_label(original_type)}{link_html}",
+                    f"🗂 {_type_label(original_type)}\n"
+                    f"📱 {account_label}{link_html}",
                     reply_markup_type="classify_medium",
                     message_id=db_msg_id,
                     extra={"original_type": original_type, "confidence": confidence,
@@ -194,7 +199,8 @@ async def process_classification(
             await notify_owner(
                 f"ℹ️ <b>{_type_label(original_type)}</b> ({confidence}%)\n"
                 f"📝 {summary}\n"
-                f"👤 {sender_name}{link_html}",
+                f"👤 {sender_name}\n"
+                f"📱 {account_label}{link_html}",
                 reply_markup_type="classify_low",
                 message_id=db_msg_id,
                 extra={"original_type": original_type, "confidence": confidence,
