@@ -579,6 +579,23 @@ async def get_messages_around(msg_db_id: int, chat_id: int, window: int = 2) -> 
         return [dict(r) for r in rows]
 
 
+async def get_context_for_classification(chat_id: int, before_db_id: int, limit: int = 10) -> list:
+    """Возвращает последние N сообщений из чата до текущего (включительно) в хрон. порядке.
+    B1: расширенный контекст для классификатора (10 сообщений вместо ±2)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, sender_id, sender_name, text, timestamp
+               FROM messages
+               WHERE chat_id = $1 AND id <= $2
+               ORDER BY id DESC
+               LIMIT $3""",
+            chat_id, before_db_id, limit,
+        )
+        # Разворачиваем в хронологический порядок (от старых к новым)
+        return [dict(r) for r in reversed(rows)]
+
+
 async def get_recent_chat_messages(chat_id: int, since: datetime, limit: int = 30) -> list:
     """Получает последние сообщения из чата за период. v4: для мониторинга задач."""
     pool = await get_pool()

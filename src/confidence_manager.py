@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, date, timedelta, timezone
 
@@ -9,7 +10,8 @@ from src.db import (
     get_setting,
     resolve_confidence,
     mark_message_processed,
-    get_messages_around,
+    get_context_for_classification,
+    get_recent_chat_messages,
 )
 from src.ai_brain import brain
 
@@ -58,6 +60,46 @@ def _reset_daily_counter():
         _today_date = today
 
 
+# ─── B3: Отложенное уведомление для MEDIUM (5 мин буфер) ────
+
+_MEDIUM_DELAY_SEC = 300  # 5 минут
+
+
+async def _delayed_medium_notify(
+    chat_id: int,
+    summary: str,
+    notify_text: str,
+    notify_kwargs: dict,
+):
+    """B3: Ждёт 5 минут, проверяет не разрешилась ли задача сама,
+    затем отправляет уведомление если задача всё ещё актуальна."""
+    await asyncio.sleep(_MEDIUM_DELAY_SEC)
+    try:
+        since = datetime.now(timezone.utc) - timedelta(seconds=_MEDIUM_DELAY_SEC + 30)
+        recent = await get_recent_chat_messages(chat_id, since, limit=8)
+        if recent:
+            messages_text = "\n".join(
+                f"[{'ВЛАДЕЛЕЦ' if config.is_owner(m.get('sender_id', 0)) else m.get('sender_name', '?')}]: {(m.get('text') or '')[:150]}"
+                for m in recent
+            )
+            prompt = (
+                f"Задача: \"{summary}\"\n\n"
+                f"Сообщения в диалоге за последние 5 минут:\n{messages_text}\n\n"
+                f"Была ли задача выполнена, отменена или стала неактуальной "
+                f"судя по этим сообщениям? Ответь одним словом: YES или NO."
+            )
+            answer = await brain.ask(prompt, model="haiku")
+            if "YES" in answer.upper():
+                logger.info(f"B3: MEDIUM задача разрешилась за 5 мин, уведомление отменено: {summary[:60]}")
+                return
+    except Exception as e:
+        logger.warning(f"B3: ошибка проверки разрешения задачи: {e}")
+
+    # Задача не разрешилась — отправляем уведомление
+    await notify_owner(notify_text, **notify_kwargs)
+    logger.info(f"B3: MEDIUM уведомление отправлено после задержки: {summary[:60]}")
+
+
 # ─── Основная логика классификации ───────────────────────────
 
 async def process_classification(
@@ -72,8 +114,8 @@ async def process_classification(
     """Классификация сообщения AI и обработка по уровню confidence.
     v6: прозрачность для ВСЕХ 3 зон + original_type + авто-remind + feedback."""
     try:
-        # v4: загружаем контекстное окно (±2 сообщения из того же чата)
-        context_messages = await get_messages_around(db_msg_id, chat_id, window=2)
+        # B1: загружаем расширенный контекст (10 сообщений до текущего включительно)
+        context_messages = await get_context_for_classification(chat_id, db_msg_id, limit=10)
 
         # v4: определяем направление — от владельца или к владельцу
         owner_is_sender = config.is_owner(sender_id) if sender_id else False
@@ -171,14 +213,16 @@ async def process_classification(
                 logger.info(f"Классификация HIGH {original_type} ({confidence}%): {summary}")
 
         elif confidence >= config.CONFIDENCE_LOW:
-            # 50-90% — НЕ создаёт задачу, спрашивает владельца
+            # 50-90% — НЕ создаёт задачу, спрашивает владельца (B3: через 5 мин)
             if db_type in ("task", "promise_mine", "promise_incoming", "question"):
-                await notify_owner(
+                notify_text = (
                     f"❓ <b>Похоже на задачу</b> ({confidence}%)\n"
                     f"📝 {summary}\n"
                     f"👤 {sender_name}\n"
                     f"🗂 {_type_label(original_type)}\n"
-                    f"📱 {account_label}{link_html}",
+                    f"📱 {account_label}{link_html}"
+                )
+                notify_kwargs = dict(
                     reply_markup_type="classify_medium",
                     message_id=db_msg_id,
                     extra={"original_type": original_type, "confidence": confidence,
@@ -190,7 +234,13 @@ async def process_classification(
                            "remind_at_iso": remind_at.isoformat() if remind_at else None,
                            "db_type": db_type, "zone": "medium"},
                 )
-                logger.info(f"Classify MEDIUM → владелец ({confidence}%): {summary}")
+                # B3: срочные уведомляем сразу, остальные — через 5 минут
+                if is_urgent:
+                    await notify_owner(notify_text, **notify_kwargs)
+                    logger.info(f"Classify MEDIUM СРОЧНОЕ → владелец ({confidence}%): {summary}")
+                else:
+                    asyncio.create_task(_delayed_medium_notify(chat_id, summary, notify_text, notify_kwargs))
+                    logger.info(f"Classify MEDIUM → отложено 5 мин ({confidence}%): {summary}")
             else:
                 logger.debug(f"Классификация MEDIUM {original_type} ({confidence}%): {summary}")
 

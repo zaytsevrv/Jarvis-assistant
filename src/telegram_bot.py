@@ -676,7 +676,19 @@ async def cb_clf_ok(callback: CallbackQuery):
         "actual_type": original_type,  # confirmed = predicted type was correct
         "confidence": confidence,
     })
-    await send_to_owner("Почему? (или /skip)")
+    # Редактируем оригинальное сообщение — не шлём новое (чтобы не улетало вниз)
+    try:
+        original_html = callback.message.html_text or ""
+        skip_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Пропустить", callback_data=f"skip_reason:{msg_id}")
+        ]])
+        await callback.message.edit_text(
+            original_html + "\n\n✅ <b>Подтверждено.</b> Напиши причину (или нажми «Пропустить»):",
+            reply_markup=skip_kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        await send_to_owner("Почему? (или /skip)")
 
 
 @router.callback_query(F.data.startswith("clf_no:"))
@@ -712,7 +724,19 @@ async def cb_clf_no(callback: CallbackQuery):
         "actual_type": "not_task",  # rejected = AI was wrong
         "confidence": confidence,
     })
-    await send_to_owner("Почему ошибка? (или /skip)")
+    # Редактируем оригинальное сообщение — не шлём новое
+    try:
+        original_html = callback.message.html_text or ""
+        skip_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Пропустить", callback_data=f"skip_reason:{msg_id}")
+        ]])
+        await callback.message.edit_text(
+            original_html + "\n\n❌ <b>Отклонено.</b> Почему ошибка? (или нажми «Пропустить»):",
+            reply_markup=skip_kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        await send_to_owner("Почему ошибка? (или /skip)")
 
 
 @router.callback_query(F.data.startswith("clf_task:"))
@@ -761,7 +785,50 @@ async def cb_clf_task(callback: CallbackQuery):
         "actual_type": "task",  # corrected: LOW was actually a task
         "confidence": confidence,
     })
-    await send_to_owner("Почему AI ошибся? (или /skip)")
+    # Редактируем оригинальное сообщение — не шлём новое
+    try:
+        original_html = callback.message.html_text or ""
+        skip_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Пропустить", callback_data=f"skip_reason:{msg_id}")
+        ]])
+        await callback.message.edit_text(
+            original_html + "\n\n📝 <b>Задача создана.</b> Почему AI ошибся? (или нажми «Пропустить»):",
+            reply_markup=skip_kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        await send_to_owner("Почему AI ошибся? (или /skip)")
+
+
+@router.callback_query(F.data.startswith("skip_reason:"))
+async def cb_skip_reason(callback: CallbackQuery):
+    """Кнопка «Пропустить» после ✅/❌ — сохраняем feedback без причины."""
+    if callback.from_user.id != config.TELEGRAM_OWNER_ID:
+        return
+    msg_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+
+    # Извлекаем pending feedback (если есть)
+    fb = _awaiting_feedback.pop(user_id, None)
+    if fb:
+        from src.db import save_classification_feedback
+        try:
+            await save_classification_feedback(
+                message_id=fb.get("msg_id", msg_id),
+                predicted_type=fb.get("original_type", "info"),
+                actual_type=fb.get("actual_type", "info"),
+                predicted_confidence=fb.get("confidence", 0),
+                user_reason=None,
+            )
+        except Exception as e:
+            logger.warning(f"skip_reason feedback save error: {e}")
+
+    # Убираем клавиатуру с кнопкой «Пропустить»
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("Пропущено")
 
 
 @router.callback_query(F.data.startswith("admin:"))
