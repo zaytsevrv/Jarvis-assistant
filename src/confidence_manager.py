@@ -6,6 +6,7 @@ from src import config
 from src.db import (
     add_to_confidence_queue,
     create_task,
+    has_similar_active_task,
     get_pending_confidence,
     get_setting,
     resolve_confidence,
@@ -177,6 +178,10 @@ async def process_classification(
         if confidence > config.CONFIDENCE_HIGH:
             # >90% — создаёт задачу + уведомляет
             if db_type in ("task", "promise_mine", "promise_incoming"):
+                # v9: дедупликация для автоматической классификации (убрана из create_task)
+                if await has_similar_active_task(summary):
+                    logger.info(f"Дубль задачи пропущен (classify HIGH): {summary[:60]}")
+                    return
                 task_id = await create_task(
                     task_type=db_type,
                     description=summary,
@@ -401,9 +406,13 @@ async def _resolve_and_create(queue_id: int, actual_type: str):
     await resolve_confidence(queue_id, actual_type)
 
     if row:
+        desc = row["text_preview"] or f"Задача от {row['sender_name']}"
+        if await has_similar_active_task(desc):
+            logger.info(f"Дубль задачи из confidence #{queue_id}")
+            return
         task_id = await create_task(
             task_type=actual_type,
-            description=row["text_preview"] or f"Задача от {row['sender_name']}",
+            description=desc,
             who=row["sender_name"] if actual_type == "promise_incoming" else None,
             confidence=100,  # Подтверждено пользователем
             source=f"confidence:{queue_id}",
@@ -412,5 +421,3 @@ async def _resolve_and_create(queue_id: int, actual_type: str):
         )
         if task_id:
             logger.info(f"Задача #{task_id} создана из confidence #{queue_id}")
-        else:
-            logger.info(f"Дубль задачи из confidence #{queue_id}")

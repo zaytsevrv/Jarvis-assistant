@@ -12,7 +12,7 @@ from src.db import (
     get_messages_since, get_dm_summary_data,
     get_tasks_completed_since, get_tasks_created_since,
     cleanup_conversation_history,
-    get_timed_reminders, mark_reminder_sent,
+    get_timed_reminders, mark_reminder_sent, complete_task,
     save_deadline_notification, get_deadline_notification_count,
     get_tracked_tasks_to_check, get_recent_chat_messages,
     update_task_last_checked, build_message_link,
@@ -227,13 +227,20 @@ async def check_timed_reminders():
             if link:
                 lines.append(f'<a href="{link}">📎</a>')
 
+            is_auto = t.get("auto_complete_on_remind")
             await notify_owner(
                 "\n".join(lines),
-                reply_markup_type="reminder",
+                reply_markup_type=None if is_auto else "reminder",
                 task_id=task_id,
             )
             await mark_reminder_sent(task_id)
-            logger.info(f"Напоминание отправлено: #{task_id} '{description[:40]}'")
+
+            # v9: авто-завершение напоминаний (remind_at без deadline/who = чистое напоминание)
+            if is_auto:
+                await complete_task(task_id)
+                logger.info(f"Авто-завершено: #{task_id} '{description[:40]}'")
+            else:
+                logger.info(f"Напоминание отправлено: #{task_id} '{description[:40]}'")
     except Exception as e:
         logger.error(f"Ошибка check_timed_reminders: {e}", exc_info=True)
 

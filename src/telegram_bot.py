@@ -5,6 +5,7 @@ import html as html_lib
 import io
 import json
 import logging
+import re as _re
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -119,8 +120,15 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
     return parts
 
 
+def _md_to_html(text: str) -> str:
+    """Конвертирует **bold** → <b>bold</b>. Только bold — italic опасен для обычных *."""
+    return _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+
+
 async def send_to_owner(text: str, reply_markup=None, parse_mode: str = "HTML"):
     """Отправка сообщения владельцу. Поддержка длинных сообщений и HTML."""
+    if parse_mode == "HTML":
+        text = _md_to_html(text)
     parts = _split_message(text, max_len=4096)
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
@@ -287,7 +295,7 @@ def _store_awaiting_feedback(user_id: int, data: dict):
 # ─── Постоянная клавиатура ───────────────────────────────────
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Запрос")]],
+    keyboard=[[KeyboardButton(text="📋 Задачи"), KeyboardButton(text="Запрос")]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -1418,6 +1426,12 @@ async def _refresh_bl_manage(message, bl: list):
 
 
 # ─── Кнопка "Запрос" + свободные сообщения ───────────────────
+
+@router.message(F.text == "📋 Задачи")
+@owner_only
+async def btn_tasks(message: Message):
+    await cmd_tasks(message)
+
 
 @router.message(F.text == "Запрос")
 @owner_only

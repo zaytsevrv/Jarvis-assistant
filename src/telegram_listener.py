@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, events
 from telethon.tl.types import (
@@ -24,6 +24,8 @@ from src.db import (
     save_message,
     mark_message_processed,
     get_tracked_tasks_for_chat,
+    get_recent_chat_messages,
+    get_active_tasks,
 )
 from src.ai_brain import brain
 
@@ -282,13 +284,35 @@ async def on_new_message(event, account_label: str = ""):
         if not text:
             return
 
-        # B2: Vision для фото в ЛС — описываем содержимое через Haiku
+        # B2+v9: Vision для фото в ЛС — описываем содержимое через Haiku с контекстом
         # Только личные чаты (там идёт классификация + task tracking)
         if msg.photo and is_private and not msg.text:
             try:
                 image_bytes = await event.client.download_media(msg, bytes)
                 if image_bytes and len(image_bytes) < 5 * 1024 * 1024:
-                    description = await brain.analyze_image(image_bytes)
+                    # v9: собираем контекст чата (последние 5 сообщений)
+                    chat_context = ""
+                    task_context = ""
+                    try:
+                        since_ctx = datetime.now(timezone.utc) - timedelta(hours=24)
+                        recent_msgs = await get_recent_chat_messages(chat_id, since_ctx, limit=5)
+                        chat_lines = []
+                        for m in reversed(recent_msgs):
+                            chat_lines.append(f"[{m.get('sender_name', '?')}]: {(m.get('text') or '')[:150]}")
+                        chat_context = "\n".join(chat_lines)
+
+                        # Задачи по этому контакту
+                        all_tasks = await get_active_tasks()
+                        contact_tasks = [t for t in all_tasks if t.get("chat_id") == chat_id]
+                        task_lines = []
+                        for t in contact_tasks[:5]:
+                            dl = f", дедлайн {t['deadline'].strftime('%d.%m')}" if t.get('deadline') else ""
+                            task_lines.append(f"#{t['id']}: {t['description'][:80]}{dl}")
+                        task_context = "\n".join(task_lines)
+                    except Exception as ctx_err:
+                        logger.debug(f"v9: ошибка сбора контекста для фото: {ctx_err}")
+
+                    description = await brain.analyze_image(image_bytes, chat_context=chat_context, task_context=task_context)
                     if description:
                         text = f"[photo: {description}]"
                         logger.debug(f"B2: фото Vision: {description[:80]}")

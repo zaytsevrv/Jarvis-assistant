@@ -461,25 +461,21 @@ async def create_task(
     telegram_msg_id: Optional[int] = None,
     account: Optional[str] = None,
     track_completion: bool = False,
+    auto_complete: bool = False,
 ) -> Optional[int]:
     """Создаёт задачу. Возвращает id или None если дубликат."""
-    # Дедупликация
-    if await has_similar_active_task(description):
-        logger.info(f"Дубль задачи пропущен: {description[:60]}")
-        return None
-
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO tasks
                (type, description, who, deadline, confidence, source, source_msg_id, chat_id,
                 remind_at, recurrence, sender_id, sender_name, telegram_msg_id, account,
-                track_completion)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                track_completion, auto_complete_on_remind)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                RETURNING id""",
             task_type, description, who, deadline, confidence, source, source_msg_id, chat_id,
             remind_at, recurrence, sender_id, sender_name, telegram_msg_id, account,
-            track_completion,
+            track_completion, auto_complete,
         )
         return row["id"]
 
@@ -490,7 +486,8 @@ async def get_timed_reminders() -> list:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT t.id, t.description, t.who, t.deadline, t.remind_at, t.recurrence,
-                      t.chat_id, t.telegram_msg_id, m.telegram_msg_id as orig_tg_msg_id
+                      t.chat_id, t.telegram_msg_id, t.auto_complete_on_remind,
+                      m.telegram_msg_id as orig_tg_msg_id
                FROM tasks t
                LEFT JOIN messages m ON t.source_msg_id = m.id
                WHERE t.remind_at IS NOT NULL
@@ -983,12 +980,12 @@ async def get_tasks_created_since(since: datetime) -> int:
 # ─── Обновление задачи ──────────────────────────────────────
 
 async def update_task(task_id: int, **kwargs):
-    """Обновление полей задачи. kwargs: description, deadline, who."""
+    """Обновление полей задачи. kwargs: description, deadline, who, remind_at, reminder_sent."""
     pool = await get_pool()
     updates = []
     values = [task_id]
     idx = 2
-    for key in ("description", "deadline", "who"):
+    for key in ("description", "deadline", "who", "remind_at", "reminder_sent"):
         if key in kwargs:
             updates.append(f"{key} = ${idx}")
             values.append(kwargs[key])

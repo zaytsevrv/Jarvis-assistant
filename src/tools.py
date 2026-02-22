@@ -68,6 +68,10 @@ TOOL_DEFINITIONS = [
                     "enum": ["daily", "weekly", "monthly"],
                     "description": "Повторение задачи. Заполняй только если пользователь явно попросил 'каждую неделю', 'ежемесячно' и т.д."
                 },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "True если пользователь явно подтвердил создание при наличии похожей задачи. НЕ ставь True без подтверждения."
+                },
             },
             "required": ["description", "task_type"],
         },
@@ -126,8 +130,8 @@ TOOL_DEFINITIONS = [
     {
         "name": "update_task",
         "description": (
-            "Изменить задачу — описание, дедлайн или ответственного. "
-            "Используй когда: 'перенеси на 20-е', 'поменяй описание'."
+            "Изменить задачу — описание, дедлайн, ответственного или время напоминания. "
+            "Используй когда: 'перенеси на 20-е', 'поменяй описание', 'перенеси напоминание на 14:00'."
         ),
         "input_schema": {
             "type": "object",
@@ -147,6 +151,10 @@ TOOL_DEFINITIONS = [
                 "new_who": {
                     "type": "string",
                     "description": "Новый ответственный (если меняется)."
+                },
+                "new_remind_at": {
+                    "type": "string",
+                    "description": "Новое время напоминания YYYY-MM-DDTHH:MM (Красноярск UTC+7). Сбрасывает флаг отправки."
                 },
             },
             "required": ["task_id"],
@@ -265,9 +273,11 @@ async def _tool_create_task(params: dict) -> dict:
     remind_at_str = params.get("remind_at")
     who = params.get("who")
     recurrence = params.get("recurrence")
+    confirmed = params.get("confirmed", False)
 
     # UTC+7 для Красноярска
     TZ_OFFSET = timezone(timedelta(hours=7))
+    now_local = datetime.now(TZ_OFFSET)
 
     deadline = None
     if deadline_str:
@@ -275,28 +285,56 @@ async def _tool_create_task(params: dict) -> dict:
             deadline = datetime.strptime(deadline_str, "%Y-%m-%d").replace(tzinfo=TZ_OFFSET)
         except ValueError:
             return {"error": f"Некорректный формат даты: {deadline_str}. Нужен YYYY-MM-DD."}
+        # v9: валидация года — если дата в прошлом, корректируем год
+        if deadline.date() < now_local.date():
+            corrected = deadline.replace(year=now_local.year)
+            if corrected.date() < now_local.date():
+                corrected = corrected.replace(year=corrected.year + 1)
+            deadline = corrected
 
     remind_at = None
     if remind_at_str:
         try:
-            # Формат YYYY-MM-DDTHH:MM, интерпретируем как Красноярское время
-            remind_at = datetime.fromisoformat(remind_at_str).replace(tzinfo=TZ_OFFSET)
+            parsed = datetime.fromisoformat(remind_at_str)
+            if parsed.tzinfo is not None:
+                remind_at = parsed.astimezone(TZ_OFFSET)
+            else:
+                remind_at = parsed.replace(tzinfo=TZ_OFFSET)
         except ValueError:
             return {"error": f"Некорректный формат времени: {remind_at_str}. Нужен YYYY-MM-DDTHH:MM."}
 
-    # Улучшенный дедуп — возвращаем данные существующей задачи
-    existing = await _find_similar_task(description)
-    if existing:
-        return {
-            "status": "duplicate",
-            "message": "Похожая задача уже существует.",
-            "existing_task": {
-                "id": existing["id"],
-                "description": existing["description"],
-                "deadline": existing["deadline"].strftime("%d.%m.%Y") if existing.get("deadline") else None,
-                "remind_at": existing["remind_at"].strftime("%d.%m %H:%M") if existing.get("remind_at") else None,
+    # v9: умная дедупликация — не блокируем, а информируем AI
+    if not confirmed:
+        existing = await _find_similar_task(description)
+        if existing:
+            # Безопасная конвертация: date/naive datetime → строка
+            ex_deadline = None
+            if existing.get("deadline"):
+                dl = existing["deadline"]
+                if hasattr(dl, "astimezone"):
+                    ex_deadline = dl.astimezone(TZ_OFFSET).strftime("%d.%m.%Y")
+                else:
+                    ex_deadline = dl.strftime("%d.%m.%Y")
+            ex_remind = None
+            if existing.get("remind_at"):
+                ra = existing["remind_at"]
+                if hasattr(ra, "astimezone"):
+                    ex_remind = ra.astimezone(TZ_OFFSET).strftime("%H:%M %d.%m")
+                else:
+                    ex_remind = str(ra)
+            return {
+                "status": "similar_exists",
+                "message": "Похожая задача уже есть. Спроси пользователя: обновить существующую или создать новую?",
+                "existing_task": {
+                    "id": existing["id"],
+                    "description": existing["description"],
+                    "deadline": ex_deadline,
+                    "remind_at": ex_remind,
+                }
             }
-        }
+
+    # v9: auto_complete — чистое напоминание (remind_at есть, deadline и who нет)
+    auto_complete = bool(remind_at and not deadline and not who)
 
     task_id = await create_task(
         task_type=task_type,
@@ -307,10 +345,11 @@ async def _tool_create_task(params: dict) -> dict:
         source="owner_dialog",
         remind_at=remind_at,
         recurrence=recurrence,
+        auto_complete=auto_complete,
     )
 
     if task_id is None:
-        return {"status": "duplicate", "message": "Похожая задача уже существует."}
+        return {"status": "error", "message": "Не удалось создать задачу."}
 
     remind_confirm = ""
     if remind_at:
@@ -325,6 +364,7 @@ async def _tool_create_task(params: dict) -> dict:
         "remind_confirm": remind_confirm,
         "who": who,
         "recurrence": recurrence,
+        "auto_complete": auto_complete,
     }
 
 
@@ -344,6 +384,7 @@ async def _find_similar_task(description: str) -> Optional[dict]:
 
 
 async def _tool_list_tasks(params: dict) -> dict:
+    TZ = timezone(timedelta(hours=7))  # Красноярск
     tasks = await get_active_tasks()
     filter_type = params.get("filter_type", "all")
 
@@ -363,9 +404,11 @@ async def _tool_list_tasks(params: dict) -> dict:
             "created_at": t["created_at"].strftime("%d.%m.%Y") if t.get("created_at") else None,
         }
         if t.get("deadline"):
-            item["deadline"] = t["deadline"].strftime("%d.%m.%Y")
+            dl = t["deadline"]
+            item["deadline"] = dl.astimezone(TZ).strftime("%d.%m.%Y") if hasattr(dl, "astimezone") else dl.strftime("%d.%m.%Y")
         if t.get("remind_at"):
-            item["remind_at"] = t["remind_at"].strftime("%H:%M %d.%m")
+            ra = t["remind_at"]
+            item["remind_at"] = ra.astimezone(TZ).strftime("%H:%M %d.%m") if hasattr(ra, "astimezone") else str(ra)
         if t.get("recurrence"):
             item["recurrence"] = t["recurrence"]
         link = build_message_link(t.get("chat_id", 0), t.get("orig_tg_msg_id", 0))
@@ -432,6 +475,31 @@ async def _tool_update_task(params: dict) -> dict:
         updates.append(f"who = ${param_idx}")
         values.append(params["new_who"])
 
+    if "new_remind_at" in params and params["new_remind_at"]:
+        try:
+            TZ_OFFSET = timezone(timedelta(hours=7))
+            parsed = datetime.fromisoformat(params["new_remind_at"])
+            if parsed.tzinfo is not None:
+                ra = parsed.astimezone(TZ_OFFSET)
+            else:
+                ra = parsed.replace(tzinfo=TZ_OFFSET)
+            param_idx += 1
+            updates.append(f"remind_at = ${param_idx}")
+            values.append(ra)
+            # Сбрасываем флаг reminder_sent чтобы напоминание сработало заново
+            param_idx += 1
+            updates.append(f"reminder_sent = ${param_idx}")
+            values.append(False)
+        except ValueError:
+            return {"error": f"Некорректное время: {params['new_remind_at']}. Нужен YYYY-MM-DDTHH:MM."}
+
+    # v9: если добавляется deadline или who — задача перестаёт быть "чистым напоминанием"
+    if ("new_deadline" in params and params["new_deadline"]) or \
+       ("new_who" in params and params["new_who"]):
+        param_idx += 1
+        updates.append(f"auto_complete_on_remind = ${param_idx}")
+        values.append(False)
+
     if not updates:
         return {"error": "Нечего обновлять — не указаны новые значения."}
 
@@ -445,7 +513,7 @@ async def _tool_update_task(params: dict) -> dict:
     return {
         "status": "updated",
         "task_id": task_id,
-        "updated_fields": list(params.keys()),
+        "updated_fields": [k for k in params.keys() if k != "task_id"],
     }
 
 
